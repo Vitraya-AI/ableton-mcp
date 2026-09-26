@@ -113,6 +113,9 @@ That's it — ask Claude to build something.
 | **Track manipulation** | Create, modify, and manipulate MIDI and audio tracks |
 | **Instrument and effect selection** | Claude can access and load the right instruments, effects and sounds from Ableton's library |
 | **Clip creation** | Create and edit MIDI clips with notes |
+| **Note editing** | Read notes, then edit or remove individual notes in place (Live 11 note IDs); note names like `C3` or `Eb2` work anywhere a pitch does |
+| **Mixing** | Set volume, pan, mute, solo, arm and send levels on tracks and the master |
+| **Scenes and undo** | Create, fire, rename and delete scenes; undo and redo any change |
 | **Arrangement view composition** | Build full songs autonomously in Arrangement View, including sections like intro, buildup, drop, breakdown, and outro |
 | **Session control** | Start and stop playback, fire clips, and control transport across Session View and Arrangement View |
 | **Anonymous telemetry** | Usage tracking to help improve the tool (can be disabled) |
@@ -249,8 +252,15 @@ Once the config file has been set on Claude, and the remote script is running in
 - Create, edit, and trigger clips
 - Control playback
 - Load instruments and effects from Ableton's browser
-- Add notes to MIDI clips
-- Change tempo and other session parameters
+- Add notes to MIDI clips, then edit, move or remove individual notes
+- Mix: volume, pan, mute, solo, arm, sends and the master track
+- Create, fire, rename and delete scenes
+- Duplicate clips, delete tracks, undo and redo
+- Change tempo, time signature and other session parameters
+
+Pitches can be MIDI numbers or note names in Ableton's convention, where
+C3 = 60. Errors from Live include a machine-readable code, for example
+`(code: track_index_out_of_range)`.
 
 ### Example Commands
 
@@ -268,6 +278,8 @@ Here are some examples of what you can ask Claude to do:
 | *"Load a 808 drum rack into the selected track"* | |
 | *"Add a jazz chord progression to the clip in track 1"* | |
 | *"Set the tempo to 120 BPM"* | |
+| *"Turn the bass down a little and pan the hats slightly right"* | |
+| *"Remove the kick from bar 2 and make the snares softer"* | |
 | *"Play the clip in track 2"* | |
 
 ---

@@ -4,6 +4,7 @@ import socket
 import json
 import logging
 import os
+import re
 import threading
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
@@ -21,6 +22,23 @@ ABLETON_PORT = int(os.environ.get("ABLETON_PORT", "9877"))
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("AbletonMCPServer")
+
+class AbletonCommandError(Exception):
+    """An error Ableton reported for a command, with its machine-readable code.
+
+    The connection is still healthy when this is raised: Ableton answered, it
+    just refused the command. Callers can branch on ``code`` (for example
+    ``track_index_out_of_range``) instead of parsing the message.
+    """
+
+    def __init__(self, message: str, code: str = "internal_error"):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+    def __str__(self):
+        return f"{self.message} (code: {self.code})"
+
 
 @dataclass
 class AbletonConnection:
@@ -139,7 +157,13 @@ class AbletonConnection:
             # Arrangement view commands
             "switch_to_arrangement_view", "set_current_song_time",
             "duplicate_session_clip_to_arrangement",
-            "create_locator"
+            "create_locator",
+            "modify_clip_notes", "remove_notes_from_clip", "duplicate_clip",
+            "delete_track", "set_time_signature", "undo", "redo",
+            "set_track_volume", "set_track_panning", "set_track_mute",
+            "set_track_solo", "set_track_arm", "set_send_level",
+            "set_master_volume", "set_master_panning",
+            "create_scene", "fire_scene", "delete_scene", "set_scene_name",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -171,10 +195,19 @@ class AbletonConnection:
             logger.info(f"Response parsed, status: {response.get('status', 'unknown')}")
 
             if response.get("status") == "error":
-                logger.error(f"Ableton error: {response.get('message')}")
-                raise Exception(response.get("message", "Unknown error from Ableton"))
-            
+                error = AbletonCommandError(
+                    response.get("message", "Unknown error from Ableton"),
+                    response.get("code", "internal_error"),
+                )
+                logger.error(f"Ableton error: {error}")
+                raise error
+
             return response.get("result", {})
+        except AbletonCommandError:
+            # Ableton answered; the socket is fine. Falling through to the
+            # generic handler below would drop the connection on every
+            # rejected command.
+            raise
         except socket.timeout:
             logger.error("Socket timeout while waiting for response from Ableton")
             self.sock = None
@@ -354,6 +387,67 @@ def get_ableton_connection():
 
 
 # Core Tool endpoints
+
+_NOTE_NAME = re.compile(r"^([A-Ga-g])(#|b)?(-?\d+)$")
+_SEMITONES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+
+
+def _parse_pitch(pitch: Union[int, str]) -> int:
+    """Turn a MIDI number or note name into a MIDI number.
+
+    Note names follow Ableton's piano roll, where C3 = 60 (so C-2 = 0 and
+    G8 = 127). "C3", "Eb2" and "F#4" all work; so do plain ints and digit
+    strings like "60".
+    """
+    if isinstance(pitch, bool):
+        raise ValueError("Pitch must be a MIDI number or a note name like C3")
+    if isinstance(pitch, (int, float)) and float(pitch).is_integer():
+        midi = int(pitch)
+    elif isinstance(pitch, str) and pitch.strip().lstrip("-").isdigit():
+        midi = int(pitch.strip())
+    elif isinstance(pitch, str):
+        match = _NOTE_NAME.match(pitch.strip())
+        if not match:
+            raise ValueError(
+                f"Invalid pitch {pitch!r}: use a MIDI number or a note name like C3, Eb2, F#4")
+        letter, accidental, octave = match.groups()
+        semitone = _SEMITONES[letter.upper()]
+        semitone += {"#": 1, "b": -1}.get(accidental, 0)
+        midi = (int(octave) + 2) * 12 + semitone
+    else:
+        raise ValueError(f"Invalid pitch {pitch!r}: use a MIDI number or a note name")
+    if not 0 <= midi <= 127:
+        raise ValueError(f"Pitch {pitch!r} is outside the MIDI range 0-127")
+    return midi
+
+
+def _parse_note_pitches(notes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Copy of notes with every "pitch" converted by _parse_pitch."""
+    parsed = []
+    for note in notes:
+        note = dict(note)
+        if "pitch" in note:
+            note["pitch"] = _parse_pitch(note["pitch"])
+        parsed.append(note)
+    return parsed
+
+
+
+def _send_gated(command_type: str, params: Dict[str, Any] = None):
+    """Send a command that older Remote Scripts may lack.
+
+    Returns (result, None), or (None, message) when the loaded Remote Script
+    does not have the command, so the tool can tell the user to update it.
+    """
+    from .script_handshake import require_capability
+
+    missing = require_capability(command_type)
+    if missing:
+        return None, missing
+    return get_ableton_connection().send_command(command_type, params or {}), None
+
+NoteValue = Union[int, float, bool, str]
+
 
 @mcp.tool()
 def set_dataset_consent(ctx: Context, consent: bool, user_said: str = "") -> str:
@@ -748,16 +842,18 @@ def add_notes_to_clip(
     ctx: Context,
     track_index: int,
     clip_index: int,
-    notes: List[Dict[str, Union[int, float, bool]]],
+    notes: List[Dict[str, NoteValue]],
     user_prompt: str = ""
 ) -> str:
     """
-    Add MIDI notes to a clip.
+    Add MIDI notes to a clip. Existing notes are kept (this appends).
 
     Parameters:
     - track_index: The index of the track containing the clip
     - clip_index: The index of the clip slot containing the clip
-    - notes: List of note dictionaries, each with pitch, start_time, duration, velocity, and mute
+    - notes: List of note dictionaries, each with pitch, start_time, duration, velocity, and mute.
+      pitch may be a MIDI number or a note name in Ableton's convention (C3 = 60), e.g. "Eb2".
+      Optional on Live 11+: probability (0.0-1.0), velocity_deviation, release_velocity.
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
@@ -765,7 +861,7 @@ def add_notes_to_clip(
         result = ableton.send_command("add_notes_to_clip", {
             "track_index": track_index,
             "clip_index": clip_index,
-            "notes": notes
+            "notes": _parse_note_pitches(notes)
         })
         return f"Added {len(notes)} notes to clip at track {track_index}, slot {clip_index}"
     except Exception as e:
@@ -814,6 +910,91 @@ def clear_notes_from_clip(
     except Exception as e:
         logger.error(f"Error clearing notes from clip: {str(e)}")
         return f"Error clearing notes from clip: {str(e)}"
+
+@mcp.tool()
+@rich_telemetry_tool("modify_clip_notes", capture_notes=True)
+@trajectory_tool("modify_clip_notes")
+def modify_clip_notes(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    notes: List[Dict[str, NoteValue]],
+    user_prompt: str = ""
+) -> str:
+    """
+    Edit existing notes in place, matched by note_id (Live 11+).
+
+    Read the clip with get_clip_notes, change the fields you want, and send
+    those notes back. Each note must include its note_id; any of pitch,
+    start_time, duration, velocity, mute, probability, velocity_deviation and
+    release_velocity it carries are applied. Other notes are left untouched.
+
+    Parameters:
+    - track_index: The index of the track containing the clip
+    - clip_index: The index of the clip slot containing the clip
+    - notes: Note dictionaries, each with note_id plus the fields to change.
+      pitch may be a note name (C3 = 60).
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("modify_clip_notes", {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "notes": _parse_note_pitches(notes),
+        })
+        if missing:
+            return missing
+        return (f"Modified {result.get('modified_count', len(notes))} note(s) "
+                f"in clip at track {track_index}, slot {clip_index}")
+    except Exception as e:
+        logger.error(f"Error modifying clip notes: {str(e)}")
+        return f"Error modifying clip notes: {str(e)}"
+
+@mcp.tool()
+@rich_telemetry_tool("remove_notes_from_clip")
+@trajectory_tool("remove_notes_from_clip")
+def remove_notes_from_clip(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    from_time: float = 0.0,
+    time_span: float = -1.0,
+    from_pitch: Union[int, str] = 0,
+    pitch_span: int = 128,
+    user_prompt: str = ""
+) -> str:
+    """
+    Remove the notes inside a time and pitch window, keeping everything else.
+
+    With the defaults it removes every note (same as clear_notes_from_clip).
+    Example: from_time=4, time_span=4 removes bar 2 in 4/4; from_pitch="C1",
+    pitch_span=1 removes only C1 (a kick on most drum racks).
+
+    Parameters:
+    - track_index: The index of the track containing the clip
+    - clip_index: The index of the clip slot containing the clip
+    - from_time: Window start in beats
+    - time_span: Window length in beats; negative means to the end of the clip
+    - from_pitch: Lowest pitch, as a MIDI number or note name (C3 = 60)
+    - pitch_span: Number of semitones from from_pitch (1-128)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("remove_notes_from_clip", {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "from_time": from_time,
+            "time_span": time_span,
+            "from_pitch": _parse_pitch(from_pitch),
+            "pitch_span": pitch_span,
+        })
+        if missing:
+            return missing
+        return (f"Removed {result.get('removed_count', '?')} note(s) "
+                f"from clip at track {track_index}, slot {clip_index}")
+    except Exception as e:
+        logger.error(f"Error removing notes from clip: {str(e)}")
+        return f"Error removing notes from clip: {str(e)}"
 
 @mcp.tool()
 @rich_telemetry_tool("set_clip_name")
@@ -1032,20 +1213,442 @@ def stop_playback(ctx: Context, user_prompt: str = "") -> str:
         return f"Error stopping playback: {str(e)}"
 
 @mcp.tool()
+@telemetry_tool("duplicate_clip")
+@trajectory_tool("duplicate_clip")
+def duplicate_clip(
+    ctx: Context,
+    track_index: int,
+    source_clip_index: int,
+    dest_clip_index: int,
+    user_prompt: str = ""
+) -> str:
+    """
+    Copy a Session clip into another (empty) slot on the same track.
+
+    Parameters:
+    - track_index: The track that owns both slots
+    - source_clip_index: Slot holding the clip to copy
+    - dest_clip_index: Empty slot to copy into
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("duplicate_clip", {
+            "track_index": track_index,
+            "source_clip_index": source_clip_index,
+            "dest_clip_index": dest_clip_index,
+        })
+        if missing:
+            return missing
+        return (f"Duplicated clip on track {track_index} "
+                f"from slot {source_clip_index} to slot {dest_clip_index}")
+    except Exception as e:
+        logger.error(f"Error duplicating clip: {str(e)}")
+        return f"Error duplicating clip: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("delete_track")
+@trajectory_tool("delete_track")
+def delete_track(ctx: Context, track_index: int, user_prompt: str = "") -> str:
+    """
+    Delete a track and everything on it. Use undo to bring it back.
+
+    Parameters:
+    - track_index: The index of the track to delete
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("delete_track", {"track_index": track_index})
+        if missing:
+            return missing
+        return f"Deleted track {track_index} ('{result.get('name', 'track')}')"
+    except Exception as e:
+        logger.error(f"Error deleting track: {str(e)}")
+        return f"Error deleting track: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("set_time_signature")
+@trajectory_tool("set_time_signature")
+def set_time_signature(ctx: Context, numerator: int, denominator: int, user_prompt: str = "") -> str:
+    """
+    Set the song's time signature.
+
+    Parameters:
+    - numerator: Beats per bar (1-99)
+    - denominator: Beat unit: 1, 2, 4, 8 or 16
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("set_time_signature", {
+            "numerator": numerator,
+            "denominator": denominator,
+        })
+        if missing:
+            return missing
+        return (f"Time signature set to {result.get('signature_numerator', numerator)}/"
+                f"{result.get('signature_denominator', denominator)}")
+    except Exception as e:
+        logger.error(f"Error setting time signature: {str(e)}")
+        return f"Error setting time signature: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("undo")
+@trajectory_tool("undo")
+def undo(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Undo the last change in Live (same as Cmd/Ctrl+Z).
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("undo")
+        if missing:
+            return missing
+        if not result.get("undone", True):
+            return result.get("reason", "Nothing to undo")
+        return "Undid the last change"
+    except Exception as e:
+        logger.error(f"Error undoing: {str(e)}")
+        return f"Error undoing: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("redo")
+@trajectory_tool("redo")
+def redo(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Redo the last undone change in Live.
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("redo")
+        if missing:
+            return missing
+        if not result.get("redone", True):
+            return result.get("reason", "Nothing to redo")
+        return "Redid the last undone change"
+    except Exception as e:
+        logger.error(f"Error redoing: {str(e)}")
+        return f"Error redoing: {str(e)}"
+
+
+# Mixer. Volume and send levels use Live's normalized fader scale:
+# 0.0 = -inf dB, 0.85 = 0 dB, 1.0 = +6 dB. The curve is not linear in dB.
+
+@mcp.tool()
+@telemetry_tool("set_track_volume")
+@trajectory_tool("set_track_volume")
+def set_track_volume(ctx: Context, track_index: int, value: float, user_prompt: str = "") -> str:
+    """
+    Set a track's volume fader.
+
+    Parameters:
+    - track_index: The index of the track
+    - value: Normalized fader position, 0.0-1.0 (0.85 = 0 dB, 1.0 = +6 dB)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("set_track_volume", {
+            "track_index": track_index, "value": value,
+        })
+        if missing:
+            return missing
+        return f"Set track {track_index} volume to {result.get('volume', value)}"
+    except Exception as e:
+        logger.error(f"Error setting track volume: {str(e)}")
+        return f"Error setting track volume: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("set_track_panning")
+@trajectory_tool("set_track_panning")
+def set_track_panning(ctx: Context, track_index: int, value: float, user_prompt: str = "") -> str:
+    """
+    Set a track's pan position.
+
+    Parameters:
+    - track_index: The index of the track
+    - value: -1.0 (hard left) to 1.0 (hard right); 0.0 is center
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("set_track_panning", {
+            "track_index": track_index, "value": value,
+        })
+        if missing:
+            return missing
+        return f"Set track {track_index} panning to {result.get('panning', value)}"
+    except Exception as e:
+        logger.error(f"Error setting track panning: {str(e)}")
+        return f"Error setting track panning: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("set_track_mute")
+@trajectory_tool("set_track_mute")
+def set_track_mute(ctx: Context, track_index: int, value: bool, user_prompt: str = "") -> str:
+    """
+    Mute or unmute a track.
+
+    Parameters:
+    - track_index: The index of the track
+    - value: True to mute, False to unmute
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("set_track_mute", {
+            "track_index": track_index, "value": value,
+        })
+        if missing:
+            return missing
+        state = "muted" if result.get("mute", value) else "unmuted"
+        return f"Track {track_index} {state}"
+    except Exception as e:
+        logger.error(f"Error setting track mute: {str(e)}")
+        return f"Error setting track mute: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("set_track_solo")
+@trajectory_tool("set_track_solo")
+def set_track_solo(ctx: Context, track_index: int, value: bool, user_prompt: str = "") -> str:
+    """
+    Solo or unsolo a track.
+
+    Parameters:
+    - track_index: The index of the track
+    - value: True to solo, False to unsolo
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("set_track_solo", {
+            "track_index": track_index, "value": value,
+        })
+        if missing:
+            return missing
+        state = "soloed" if result.get("solo", value) else "unsoloed"
+        return f"Track {track_index} {state}"
+    except Exception as e:
+        logger.error(f"Error setting track solo: {str(e)}")
+        return f"Error setting track solo: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("set_track_arm")
+@trajectory_tool("set_track_arm")
+def set_track_arm(ctx: Context, track_index: int, value: bool, user_prompt: str = "") -> str:
+    """
+    Arm or disarm a track for recording. Group tracks cannot be armed
+    (code: track_not_armable); get_track_info reports can_be_armed.
+
+    Parameters:
+    - track_index: The index of the track
+    - value: True to arm, False to disarm
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("set_track_arm", {
+            "track_index": track_index, "value": value,
+        })
+        if missing:
+            return missing
+        state = "armed" if result.get("arm", value) else "disarmed"
+        return f"Track {track_index} {state}"
+    except Exception as e:
+        logger.error(f"Error setting track arm: {str(e)}")
+        return f"Error setting track arm: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("set_send_level")
+@trajectory_tool("set_send_level")
+def set_send_level(
+    ctx: Context,
+    track_index: int,
+    send_index: int,
+    value: float,
+    user_prompt: str = ""
+) -> str:
+    """
+    Set how much of a track is sent to a return track.
+
+    Parameters:
+    - track_index: The index of the sending track
+    - send_index: Which send (0 = Send A, 1 = Send B, ...)
+    - value: Normalized send level, 0.0-1.0 (0.85 = 0 dB)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("set_send_level", {
+            "track_index": track_index, "send_index": send_index, "value": value,
+        })
+        if missing:
+            return missing
+        return (f"Set track {track_index} send {send_index} "
+                f"to {result.get('value', value)}")
+    except Exception as e:
+        logger.error(f"Error setting send level: {str(e)}")
+        return f"Error setting send level: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("set_master_volume")
+@trajectory_tool("set_master_volume")
+def set_master_volume(ctx: Context, value: float, user_prompt: str = "") -> str:
+    """
+    Set the master track's volume fader.
+
+    Parameters:
+    - value: Normalized fader position, 0.0-1.0 (0.85 = 0 dB, 1.0 = +6 dB)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("set_master_volume", {"value": value})
+        if missing:
+            return missing
+        return f"Set master volume to {result.get('volume', value)}"
+    except Exception as e:
+        logger.error(f"Error setting master volume: {str(e)}")
+        return f"Error setting master volume: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("set_master_panning")
+@trajectory_tool("set_master_panning")
+def set_master_panning(ctx: Context, value: float, user_prompt: str = "") -> str:
+    """
+    Set the master track's pan position.
+
+    Parameters:
+    - value: -1.0 (hard left) to 1.0 (hard right); 0.0 is center
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("set_master_panning", {"value": value})
+        if missing:
+            return missing
+        return f"Set master panning to {result.get('panning', value)}"
+    except Exception as e:
+        logger.error(f"Error setting master panning: {str(e)}")
+        return f"Error setting master panning: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("create_scene")
+@trajectory_tool("create_scene")
+def create_scene(ctx: Context, index: int = -1, user_prompt: str = "") -> str:
+    """
+    Add a scene (a row of clip slots across every track).
+
+    Parameters:
+    - index: Where to insert it (-1 = after the last scene)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("create_scene", {"index": index})
+        if missing:
+            return missing
+        return f"Created scene {result.get('index', index)}"
+    except Exception as e:
+        logger.error(f"Error creating scene: {str(e)}")
+        return f"Error creating scene: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("fire_scene")
+@trajectory_tool("fire_scene")
+def fire_scene(ctx: Context, scene_index: int, user_prompt: str = "") -> str:
+    """
+    Launch every clip in a scene.
+
+    Parameters:
+    - scene_index: The index of the scene to launch
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("fire_scene", {"scene_index": scene_index})
+        if missing:
+            return missing
+        return f"Fired scene {scene_index}"
+    except Exception as e:
+        logger.error(f"Error firing scene: {str(e)}")
+        return f"Error firing scene: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("delete_scene")
+@trajectory_tool("delete_scene")
+def delete_scene(ctx: Context, scene_index: int, user_prompt: str = "") -> str:
+    """
+    Delete a scene and the clips in its row. Use undo to bring it back.
+
+    Parameters:
+    - scene_index: The index of the scene to delete
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("delete_scene", {"scene_index": scene_index})
+        if missing:
+            return missing
+        return f"Deleted scene {scene_index}"
+    except Exception as e:
+        logger.error(f"Error deleting scene: {str(e)}")
+        return f"Error deleting scene: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_scene_name")
+@trajectory_tool("set_scene_name")
+def set_scene_name(ctx: Context, scene_index: int, name: str, user_prompt: str = "") -> str:
+    """
+    Rename a scene.
+
+    Parameters:
+    - scene_index: The index of the scene to rename
+    - name: The new name
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("set_scene_name", {
+            "scene_index": scene_index, "name": name,
+        })
+        if missing:
+            return missing
+        return f"Renamed scene {scene_index} to: {result.get('name', name)}"
+    except Exception as e:
+        logger.error(f"Error setting scene name: {str(e)}")
+        return f"Error setting scene name: {str(e)}"
+
+@mcp.tool()
 @rich_telemetry_tool("get_browser_tree")
 @trajectory_tool("get_browser_tree")
-def get_browser_tree(ctx: Context, category_type: str = "all", user_prompt: str = "") -> str:
+def get_browser_tree(
+    ctx: Context,
+    category_type: str = "all",
+    max_depth: int = 1,
+    user_prompt: str = "",
+) -> str:
     """
     Get a hierarchical tree of browser categories from Ableton.
 
+    Folders deeper than max_depth are marked [...]; open them with
+    get_browser_items_at_path.
+
     Parameters:
     - category_type: Type of categories to get ('all', 'instruments', 'sounds', 'drums', 'audio_effects', 'midi_effects')
+    - max_depth: Folder levels to expand below each category (0-2, default 1). 2 can take several seconds.
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("get_browser_tree", {
-            "category_type": category_type
+            "category_type": category_type,
+            "max_depth": max_depth,
         })
         
         # Check if we got any categories
@@ -1560,6 +2163,9 @@ def record_audition(
 # Main execution
 def main():
     """Run the MCP server"""
+    from . import dataset_visibility
+
+    dataset_visibility.apply(mcp)
     mcp.run()
 
 if __name__ == "__main__":
