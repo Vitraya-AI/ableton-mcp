@@ -177,6 +177,17 @@ def needs_prompt() -> bool:
     return consent_state() == UNKNOWN
 
 
+# Set when the dataset tools are hidden (see MCP_Server/dataset_visibility.py):
+# the question would ask the model to call a tool that is not registered.
+_prompt_suppressed = False
+
+
+def suppress_prompt() -> None:
+    """Never surface the consent question in this process."""
+    global _prompt_suppressed
+    _prompt_suppressed = True
+
+
 # How long to stay quiet after surfacing the question without getting an
 # answer. Long enough that a dismissed prompt does not reappear on the user's
 # very next action, short enough that a later session gets another chance.
@@ -192,7 +203,7 @@ def may_ask_now() -> bool:
     after someone closed the box is nagging, and it pressures an answer that
     should be freely given.
     """
-    if not needs_prompt():
+    if _prompt_suppressed or not needs_prompt():
         return False
     with _lock:
         last = _read_state().get("last_prompted_at") or 0
