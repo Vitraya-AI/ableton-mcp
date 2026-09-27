@@ -1,6 +1,6 @@
 # Extended Features Port — Plan
 
-Status: **approved, not started** (written 2026-09-26). Work happens on the
+Status: **Phase 0 done (Remote Script 1.9.0); next is Phase 1** (written 2026-09-26). Work happens on the
 `extended-features` branch. This document is the hand-off: a new session should
 be able to start Phase 0 from here without the conversation that produced it.
 
@@ -63,7 +63,16 @@ against the "Added in Live 12" list:
 | `Device.is_active` | ✅ read-only | Toggle a device with its "Device On" parameter (`parameters[0]`), as the extended repo does. |
 | `PluginDevice.presets`, `selected_preset_index` | ✅ | Preset browsing only exists for plugin devices. |
 
-## Phase 0 — Groundwork (Remote Script 1.9.0 together with Phase 1)
+## Phase 0 — Groundwork ✅ done (Remote Script 1.9.0)
+
+Implemented as specified below, plus a server fix: `receive_full_response`
+no longer resets every command's socket timeout to 15 s, so each command
+keeps its own (reads 10 s, edits 15 s, `create_audio_clip` 65 s,
+`dump_live_api` 60 s). Helpers now available: `script_handshake.live_api_available(flag)`,
+`script_handshake.live_version()`, and `MCP_Server/timing.py`
+(`resolve_position`, `resolve_length`, `bar_to_beat`, `beat_to_bar`).
+**Still to do in Live:** run the Phase 0 smoke checks and the API dump; record
+whether `ClipSlot.create_audio_clip` exists on 11.3.
 
 1. **Live version and API flags in the handshake.** `get_script_info` gains
    `live_version` (from `Live.Application.get_application().get_major_version()`
@@ -84,7 +93,7 @@ against the "Added in Live 12" list:
    (fetched once per call from `get_session_info`). Beats per bar =
    `numerator * 4 / denominator`. Bar 1 = beat 0. Reject bar < 1.
 
-## Phase 1 — Arrangement (Remote Script 1.9.0)
+## Phase 1 — Arrangement (Remote Script 1.9.1)
 
 Existing arrangement tools in the fork, keep as they are: `create_locator`,
 `duplicate_to_arrangement`, `get_arrangement_clips`, `set_arrangement_time`,

@@ -289,3 +289,26 @@ def test_handshake_still_detects_legacy_scripts(monkeypatch):
 
     info = script_handshake.handshake(send)
     assert info["script_version"] == "legacy"
+
+
+class TimeoutRecordingSocket(FakeSocket):
+    def __init__(self, response):
+        super().__init__(response)
+        self.timeouts = []
+
+    def settimeout(self, timeout):
+        self.timeouts.append(timeout)
+
+
+@pytest.mark.parametrize("command, expected", [
+    ("get_session_info", 10.0),
+    ("set_track_mute", 15.0),
+    ("create_audio_clip", 65.0),
+    ("dump_live_api", 60.0),
+])
+def test_each_command_keeps_its_own_socket_timeout(command, expected):
+    """receive_full_response used to reset every timeout to 15 s."""
+    sock = TimeoutRecordingSocket({"status": "success", "result": {}})
+    conn = server.AbletonConnection(host="localhost", port=0, sock=sock)
+    conn.send_command(command, {})
+    assert sock.timeouts == [expected]

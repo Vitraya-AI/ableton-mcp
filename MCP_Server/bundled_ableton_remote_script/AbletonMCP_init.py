@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.8.1"
+SCRIPT_VERSION = "1.9.0"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -76,6 +76,7 @@ SCRIPT_CAPABILITIES = [
     "fire_scene",
     "delete_scene",
     "set_scene_name",
+    "dump_live_api",
     "error_codes",
 ]
 
@@ -369,6 +370,7 @@ class AbletonMCP(ControlSurface):
                 include_notes=p("include_notes", True),
                 include_params=p("include_params", True)),
             "drain_passive_events": lambda: self._drain_passive_events(),
+            "dump_live_api": lambda: self._dump_live_api(p("module", None)),
         }
 
     def _main_thread_handlers(self, params):
@@ -539,7 +541,156 @@ class AbletonMCP(ControlSurface):
             "capabilities": list(SCRIPT_CAPABILITIES),
             "snapshot_schema": "ableton_mcp_snapshot_v2",
             "passive_listeners": True,
+            "live_version": self._live_version(),
+            "live_api": self._live_api_flags(),
         }
+
+    # flag -> (Live submodule, class, attribute). Checked on the class object,
+    # so the answer is about this Live build, not about any particular set.
+    _LIVE_API_FLAGS = (
+        ("track_create_midi_clip", ("Track", "Track", "create_midi_clip")),
+        ("track_create_audio_clip", ("Track", "Track", "create_audio_clip")),
+        ("clip_slot_create_audio_clip", ("ClipSlot", "ClipSlot", "create_audio_clip")),
+        ("song_begin_undo_step", ("Song", "Song", "begin_undo_step")),
+        ("clip_automation_envelope", ("Clip", "Clip", "automation_envelope")),
+        ("automation_envelope_insert_step", ("Clip", "AutomationEnvelope", "insert_step")),
+        # Live 12 moved insert_step to Live.Envelope; the module is absent on 11.
+        ("envelope_insert_step", ("Envelope", "Envelope", "insert_step")),
+        ("plugin_device_presets", ("PluginDevice", "PluginDevice", "presets")),
+    )
+
+    _LIVE_DOC_LIMIT = 2000
+
+    def _live_version(self):
+        """{"major", "minor", "bugfix", "string"} of the running Live, or None."""
+        try:
+            import Live
+            app = Live.Application.get_application()
+            major = int(app.get_major_version())
+            minor = int(app.get_minor_version())
+            bugfix = int(app.get_bugfix_version())
+        except Exception:
+            return None
+        return {
+            "major": major,
+            "minor": minor,
+            "bugfix": bugfix,
+            "string": "%d.%d.%d" % (major, minor, bugfix),
+        }
+
+    def _live_api_flags(self):
+        """Which version-dependent Live API calls this Live build has.
+
+        Empty when the Live module is unavailable (outside Live, in tests).
+        """
+        try:
+            import Live
+        except Exception:
+            return {}
+        flags = {}
+        for flag, (module_name, class_name, attr) in self._LIVE_API_FLAGS:
+            try:
+                klass = getattr(getattr(Live, module_name), class_name)
+                flags[flag] = bool(hasattr(klass, attr))
+            except Exception:
+                flags[flag] = False
+        return flags
+
+    def _dump_live_api(self, module=None):
+        """Introspect the Live module for developer reference.
+
+        Without a module: the list of Live.* submodules. With one: every class
+        in it (nested ones keyed "Outer.Inner") with its members and
+        Boost.Python docstrings, which carry the call signatures.
+        """
+        try:
+            import Live
+        except Exception:
+            raise CommandError("Live module unavailable", "internal_error")
+
+        import inspect
+
+        if not module:
+            names = [name for name in dir(Live)
+                     if not name.startswith("_")
+                     and inspect.ismodule(getattr(Live, name, None))]
+            return {"live_version": self._live_version(), "modules": sorted(names)}
+
+        target = None
+        if not str(module).startswith("_"):
+            target = getattr(Live, str(module), None)
+        if not inspect.ismodule(target):
+            raise CommandError("Unknown Live module: %s" % module, "invalid_value")
+
+        classes = {}
+        seen = set()
+        for name in sorted(dir(target)):
+            if name.startswith("_"):
+                continue
+            value = getattr(target, name, None)
+            if inspect.isclass(value):
+                self._dump_live_class(name, value, classes, seen)
+        return {
+            "module": str(module),
+            "live_version": self._live_version(),
+            "classes": classes,
+        }
+
+    def _dump_live_class(self, qualified_name, klass, classes, seen):
+        """Record klass and, recursively, the classes nested in it."""
+        if id(klass) in seen:
+            return
+        seen.add(id(klass))
+        members = {}
+        nested = []
+        for name in sorted(dir(klass)):
+            if name.startswith("_") and name != "__init__":
+                continue
+            try:
+                value = self._static_class_attr(klass, name)
+            except Exception:
+                continue
+            kind = self._live_member_kind(value)
+            doc = None
+            if kind != "attribute":
+                doc = self._live_doc(value)
+            members[name] = {"kind": kind, "doc": doc}
+            if kind == "class":
+                nested.append((name, value))
+        classes[qualified_name] = {"doc": self._live_doc(klass), "members": members}
+        for name, value in nested:
+            self._dump_live_class(qualified_name + "." + name, value, classes, seen)
+
+    @staticmethod
+    def _static_class_attr(klass, name):
+        """klass.<name> without triggering descriptors, so a property shows
+        up as the property rather than whatever it computes on the class."""
+        for base in getattr(klass, "__mro__", (klass,)):
+            base_dict = getattr(base, "__dict__", {})
+            if name in base_dict:
+                return base_dict[name]
+        return getattr(klass, name)
+
+    @staticmethod
+    def _live_member_kind(value):
+        import inspect
+        if inspect.isclass(value):
+            return "class"
+        if isinstance(value, (staticmethod, classmethod)) or callable(value):
+            return "method"
+        if hasattr(value, "__get__") or hasattr(value, "__set__"):
+            return "property"
+        return "attribute"
+
+    def _live_doc(self, value):
+        doc = getattr(value, "__doc__", None)
+        if doc is None:
+            return None
+        try:
+            doc = str(doc)
+        except Exception:
+            return None
+        return doc[:self._LIVE_DOC_LIMIT]
     
     def _safe_song_property(self, attr, cast, default):
         """Read self._song.<attr> with cast, returning default on common failures.

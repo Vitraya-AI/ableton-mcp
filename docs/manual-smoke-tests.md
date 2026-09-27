@@ -9,7 +9,10 @@ to the Remote Script.
 1. Run `ableton-mcp-install-script`, then restart Live.
 2. Open a fresh, empty Live set.
 3. Start the MCP server and call `get_remote_script_info`. Confirm it reports
-   script version 1.8.1 and `up_to_date: true`.
+   script version 1.9.0 and `up_to_date: true`. Confirm `live_version` shows
+   your Live build and `live_api` lists the version-dependent APIs (on Live 11
+   expect `track_create_midi_clip: false`, `song_begin_undo_step: true`,
+   `automation_envelope_insert_step: true`).
 4. Keep Live visible so you can confirm each change in the UI.
 
 ## Note editing (Live 11+ note IDs)
@@ -83,3 +86,16 @@ to the Remote Script.
    size, and its timestamp against "Sending command" gives the duration.
 2. `max_depth` is capped at 2: depth 3 took 9.8 s and 634 KB, against a 10 s
    read timeout.
+
+## Live API dump (developer)
+
+1. With Live running, run
+   `uv --directory /Volumes/ADrive/Gits/ableton-mcp-vitraya run ableton-mcp-dump-live-api`.
+   It writes `docs/live-api/<your Live version>/` with one JSON file per
+   module and an `index.md` (gitignored).
+2. Open `index.md` and confirm `Track`, `Song`, `Clip` and `ClipSlot` list
+   members with signatures in the Doc column. Check whether `ClipSlot`
+   has `create_audio_clip` and note the result in
+   `docs/extended-features-plan.md` (it decides a Phase 1 detail).
+3. Check the MCP server log: each module request should finish well inside
+   the 60 s allowance.

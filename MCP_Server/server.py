@@ -80,9 +80,13 @@ class AbletonConnection:
                     self.sock = None
 
     def receive_full_response(self, sock, buffer_size=8192):
-        """Receive the complete response, potentially in multiple chunks"""
+        """Receive the complete response, potentially in multiple chunks.
+
+        Uses the timeout the caller set on ``sock``; send_command picks it per
+        command. (This used to reset it to 15 s, which overrode both the 10 s
+        read budget and the longer budgets in long_running_commands.)
+        """
         chunks = []
-        sock.settimeout(15.0)  # Increased timeout for operations that might take longer
         
         try:
             while True:
@@ -170,7 +174,11 @@ class AbletonConnection:
         # than the default modifying-command budget (e.g. importing/decoding a
         # large audio file). Give them a wider socket timeout so we don't time
         # out before the Remote Script's own queue does.
-        long_running_commands = {"create_audio_clip": 65.0}
+        long_running_commands = {
+            "create_audio_clip": 65.0,
+            # Introspects a whole Live module; large modules take a while.
+            "dump_live_api": 60.0,
+        }
         
         try:
             logger.info(f"Sending command: {command_type} with params: {params}")
