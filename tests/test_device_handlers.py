@@ -96,10 +96,11 @@ class FakeDevice(object):
     can_have_chains = False
     can_have_drum_pads = False
 
-    def __init__(self, name="Operator", class_name="Operator", params=None):
+    def __init__(self, name="Operator", class_name="Operator", params=None, live_type=1):
         self.name = name
         self.class_name = class_name
-        self.class_display_name = "Instrument " + class_name
+        self.class_display_name = class_name
+        self.type = live_type  # Live.Device.DeviceType: 1 instrument, 2 audio effect, 4 MIDI effect
         self.parameters = [device_on()] + list(params or [])
 
     @property
@@ -286,7 +287,7 @@ def rack_song():
         FakeParam("Osc Type", 1.0, 0.0, 3.0, is_quantized=True,
                   items=["Sine", "Saw", "Square", "Noise"]),
     ])
-    saturator = FakeDevice("Saturator", "Saturator", [FakeParam("Drive", 0.2)])
+    saturator = FakeDevice("Saturator", "Saturator", [FakeParam("Drive", 0.2)], live_type=2)
     analog = FakeDevice("Analog", "UltraAnalog")
     rack = FakeRack("Keys Rack", [FakeChain("Bass", [wavetable, saturator]),
                                   FakeChain("Lead", [analog])], macro_count=4)
@@ -392,7 +393,7 @@ def test_get_rack_info_instrument_rack(script):
     assert [c["name"] for c in info["chains"]] == ["Bass", "Lead"]
     bass = info["chains"][0]
     assert bass["devices"][1] == {"index": 1, "name": "Saturator", "class_name": "Saturator",
-                                  "type": "instrument", "is_active": True,
+                                  "type": "audio_effect", "is_active": True,
                                   "is_rack": False}
     assert info["drum_pads"] == []
 
@@ -649,3 +650,44 @@ def test_load_that_never_changes_the_devices(script):
     assert result["new_devices"] == []
     assert result["devices_after"] == ["Operator"]
     assert song.events.count("tick") == 30
+
+
+# --------------------------------------------------------------------------
+# Device type from Live's Device.type (1.11.1)
+# --------------------------------------------------------------------------
+
+class _LiveEnumValue(int):
+    """Boost.Python enum values are ints with a .name."""
+
+    def __new__(cls, value, name):
+        obj = int.__new__(cls, value)
+        obj.name = name
+        return obj
+
+
+@pytest.mark.parametrize("live_type, expected", [
+    (_LiveEnumValue(1, "instrument"), "instrument"),
+    (_LiveEnumValue(2, "audio_effect"), "audio_effect"),
+    (_LiveEnumValue(4, "midi_effect"), "midi_effect"),
+    (_LiveEnumValue(0, "undefined"), "unknown"),
+    (2, "audio_effect"),          # plain int, no .name
+    (None, "unknown"),
+])
+def test_device_type_comes_from_live(script, live_type, expected):
+    """Chain devices such as Utility reported "unknown": the old code guessed
+    from class names, which Live's names don't follow."""
+    import types as _types
+    device = _types.SimpleNamespace(can_have_drum_pads=False, can_have_chains=False,
+                                    type=live_type, class_name="StereoGain",
+                                    class_display_name="Utility")
+    inst = script.AbletonMCP.__new__(script.AbletonMCP)
+    assert inst._get_device_type(device) == expected
+
+
+def test_racks_and_drum_racks_keep_their_labels(script):
+    import types as _types
+    inst = script.AbletonMCP.__new__(script.AbletonMCP)
+    drum = _types.SimpleNamespace(can_have_drum_pads=True, can_have_chains=True, type=1)
+    rack = _types.SimpleNamespace(can_have_drum_pads=False, can_have_chains=True, type=2)
+    assert inst._get_device_type(drum) == "drum_machine"
+    assert inst._get_device_type(rack) == "rack"

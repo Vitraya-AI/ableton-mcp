@@ -1,6 +1,6 @@
 # Extended Features Port — Plan
 
-Status: **Phases 0–2 implemented (Remote Script 1.11.0). Phases 0–1 verified in Live 11.3.43; Phase 2 awaiting the "Devices and racks (1.11.0)" Live checks. After that: README update, then Phases 3–4 if wanted** (written 2026-09-26). Work happens on the
+Status: **Phases 0–2 done and verified in Live 11.3.43 (Remote Script 1.11.1). Remaining: README update, merge to main; Phases 3–4 optional** (written 2026-09-26). Work happens on the
 `extended-features` branch. This document is the hand-off: a new session should
 be able to start Phase 0 from here without the conversation that produced it.
 
@@ -168,6 +168,13 @@ can't act on the outer device. Phase 1 loose ends folded in:
 `new_devices`; playhead-restore results carry `playhead_time`. Drum pads map
 to `rack.chains` with `==` (Live hands out new wrappers per read) — verify
 in Live (smoke check 3). Tool list: 60 tools, ~12.7k tokens.
+
+Live test (2026-09-27): all checks pass on 11.3.43, including drum-pad →
+chain mapping on a real kit. Preset stepping is only partly tested (Serum 2
+exposes one preset to Live). Follow-ups in 1.11.1: device `type` now comes
+from Live's `Device.type` (upstream guessed from class names, so chain
+devices read "unknown"); tool docs say `is_enabled: false` means the
+parameter is macro-mapped and the macro overrides it.
 
 **Device addressing inside racks.** Add optional `chain_index` and
 `chain_device_index` to `get_device_parameters`, `set_device_parameter`,

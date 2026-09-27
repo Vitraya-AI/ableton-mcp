@@ -35,7 +35,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.11.0"
+SCRIPT_VERSION = "1.11.1"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -2951,23 +2951,30 @@ class AbletonMCP(ControlSurface):
             "macros_mapped": list(getattr(rack, "macros_mapped", [])),
         }
     
+    # Live.Device.DeviceType values (0 = undefined).
+    _DEVICE_TYPES = {1: "instrument", 2: "audio_effect", 4: "midi_effect"}
+
     def _get_device_type(self, device):
-        """Get the type of a device"""
+        """drum_machine / rack, else Live's own Device.type.
+
+        This used to guess from class names ("instrument" in the display
+        name...), which Live's names don't follow, so most devices came back
+        "unknown".
+        """
         try:
-            # Simple heuristic - in a real implementation you'd look at the device class
-            if device.can_have_drum_pads:
+            if getattr(device, "can_have_drum_pads", False):
                 return "drum_machine"
-            elif device.can_have_chains:
+            if getattr(device, "can_have_chains", False):
                 return "rack"
-            elif "instrument" in device.class_display_name.lower():
-                return "instrument"
-            elif "audio_effect" in device.class_name.lower():
-                return "audio_effect"
-            elif "midi_effect" in device.class_name.lower():
-                return "midi_effect"
-            else:
+            live_type = getattr(device, "type", None)
+            name = getattr(live_type, "name", None)
+            if name in ("instrument", "audio_effect", "midi_effect"):
+                return str(name)
+            try:
+                return self._DEVICE_TYPES.get(int(live_type), "unknown")
+            except (TypeError, ValueError):
                 return "unknown"
-        except:
+        except Exception:
             return "unknown"
 
     # ── Passive human-UI listeners ──────────────────────────────────────────────

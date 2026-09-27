@@ -9,7 +9,7 @@ to the Remote Script.
 1. Run `ableton-mcp-install-script`, then restart Live.
 2. Open a fresh, empty Live set.
 3. Start the MCP server and call `get_remote_script_info`. Confirm it reports
-   script version 1.11.0 and `up_to_date: true`. Confirm `live_version` shows
+   script version 1.11.1 and `up_to_date: true`. Confirm `live_version` shows
    your Live build and `live_api` lists the version-dependent APIs (on Live 11
    expect `track_create_midi_clip: false`, `song_begin_undo_step: true`,
    `automation_envelope_insert_step: true`).
@@ -128,6 +128,10 @@ a third-party plugin (VST/AU) if you have one.
 3. `get_rack_info` on the Drum Rack: `is_drum_rack: true`, only filled pads,
    and each pad's `chain_indices` is **not empty** (it maps pads to chains;
    an empty list would mean Live objects don't compare equal as expected).
+   Confirmed on 11.3.43 with "808 Core Kit" (mapping follows the chains, not
+   list order). An empty Drum Rack has no pads to check — load a kit.
+   Chain devices report their real `type` (Utility → `audio_effect`) since
+   1.11.1.
 4. `get_device_parameters` with `chain_index` / `chain_device_index` on a
    device inside a rack chain — including the **second** device in a chain.
    Quantized parameters (e.g. a filter type) list `value_items`.
@@ -141,7 +145,9 @@ a third-party plugin (VST/AU) if you have one.
    back in one step.
 8. `navigate_device_preset` on the plugin: `current`, then `next`, then
    `previous` — the reply names the preset Live shows. On a Live device (e.g.
-   Drift): `not_supported`.
+   Drift): `not_supported`. Needs a plugin that exposes its program list to
+   Live: Serum 2 shows a single "Default" preset, so stepping can't be
+   exercised with it (still open).
 9. Past-the-end playhead: repeat Arrangement step 2 with the playhead past the
    end of the song; the note says where the playhead stopped (beat and bar).
 

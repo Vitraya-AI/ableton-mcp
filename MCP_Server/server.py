@@ -771,7 +771,9 @@ def get_device_parameters(
 ) -> str:
     """
     Read all parameters for a device (index, name, value, min, max; switch
-    parameters also list their named positions as value_items).
+    parameters also list their named positions as value_items). is_enabled:
+    false means the parameter is mapped to a rack macro (or disabled by Max);
+    set the macro instead, since it overrides the parameter.
 
     Addressing: device_index picks a device on the track itself. To reach a
     device inside a rack (Instrument/Audio Effect/Drum Rack), also give
@@ -818,7 +820,9 @@ def set_device_parameter(
     Set a device parameter to a specific value.
 
     Use get_device_parameters first to discover parameter names, indices and
-    ranges. Give exactly one of parameter_index or parameter_name. Devices
+    ranges. Give exactly one of parameter_index or parameter_name. A parameter
+    with is_enabled: false is mapped to a rack macro (or disabled by Max):
+    the macro overrides it, so change the macro on the rack instead. Devices
     inside racks are addressed as in get_device_parameters (chain_index,
     chain_device_index).
 
