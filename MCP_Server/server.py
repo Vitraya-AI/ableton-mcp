@@ -171,6 +171,7 @@ class AbletonConnection:
             "create_scene", "fire_scene", "delete_scene", "set_scene_name",
             "cue_point", "set_arrangement_loop", "create_arrangement_midi_clip",
             "create_arrangement_audio_clip", "set_clip_properties",
+            "set_device_enabled", "delete_device", "navigate_device_preset",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -515,11 +516,76 @@ def _bar_or_none(beat, numerator: int, denominator: int):
 
 
 def _playhead_note(result: Dict[str, Any]) -> str:
-    """Sentence to append when Live could not put the playhead back."""
-    if result.get("playhead_restored") is False:
-        return (" Note: the playhead could not be moved back to where it was "
-                "(it was past the end of the song).")
-    return ""
+    """Sentence to append when Live could not put the playhead back.
+
+    Live clamps the playhead to the song length, so a playhead that sat past
+    the end of the song lands at the end instead.
+    """
+    if result.get("playhead_restored") is not False:
+        return ""
+    where = "at the end of the song"
+    try:
+        landed = float(result.get("playhead_time"))
+    except (TypeError, ValueError):
+        landed = None
+    if landed is not None:
+        where = f"at beat {landed:g}"
+        try:
+            num, den = _time_signature_for(landed)
+            bar = _bar_or_none(landed, num, den)
+            if bar is not None:
+                where += f" (bar {bar:g})"
+        except Exception:
+            pass
+        where += ", the end of the song"
+    return (f" Note: the playhead could not be moved back to where it was; "
+            f"it stopped {where}.")
+
+
+def _device_address(params: Dict[str, Any], chain_index: Optional[int],
+                    chain_device_index: Optional[int]) -> str | None:
+    """Add chain addressing to params when used.
+
+    Returns a missing-capability message when the Remote Script predates
+    chain addressing (it would act on the outer rack instead), else None.
+    Raises ValueError for chain_device_index without chain_index.
+    """
+    if chain_index is None and chain_device_index is None:
+        return None
+    if chain_index is None:
+        raise ValueError("chain_device_index needs chain_index")
+    from .script_handshake import require_capability
+
+    missing = require_capability("device_chain_param")
+    if missing:
+        return missing
+    params["chain_index"] = chain_index
+    if chain_device_index is not None:
+        params["chain_device_index"] = chain_device_index
+    return None
+
+
+def _device_label(track_index: int, device_index: int, chain_index: Optional[int] = None,
+                  chain_device_index: Optional[int] = None) -> str:
+    label = f"track {track_index}, device {device_index}"
+    if chain_index is not None:
+        label += f", chain {chain_index}, chain device {chain_device_index or 0}"
+    return label
+
+
+def _describe_load(result: Dict[str, Any]) -> str:
+    """Summarise a load_browser_item result's device list."""
+    new_devices = result.get("new_devices") or []
+    devices_after = result.get("devices_after") or []
+    if new_devices:
+        return f"New devices: {', '.join(new_devices)}"
+    if result.get("devices_changed") is False:
+        return ("The track's device list has not changed yet, so the load may "
+                "still be in progress; check with get_track_info. Devices on "
+                f"track: {', '.join(devices_after) or '(none)'}")
+    if devices_after:
+        return f"Devices on track: {', '.join(devices_after)}"
+    return "Device list not reported; check with get_track_info"
 
 
 def _bars_or_none(beats, numerator: int, denominator: int):
@@ -699,22 +765,35 @@ def get_device_parameters(
     ctx: Context,
     track_index: int,
     device_index: int,
+    chain_index: Optional[int] = None,
+    chain_device_index: Optional[int] = None,
     user_prompt: str = "",
 ) -> str:
     """
-    Read all parameters for a device on a track (name, value, min, max).
+    Read all parameters for a device (index, name, value, min, max; switch
+    parameters also list their named positions as value_items).
+
+    Addressing: device_index picks a device on the track itself. To reach a
+    device inside a rack (Instrument/Audio Effect/Drum Rack), also give
+    chain_index (the chain in that rack) and chain_device_index (the device
+    in that chain, default 0). get_rack_info lists a rack's chains and their
+    devices. One level of nesting only: a rack inside a chain can be
+    addressed, but not the devices inside it.
 
     Parameters:
     - track_index: Track that owns the device
     - device_index: Index into the track's device chain
+    - chain_index: Chain inside the rack at device_index (optional; see Addressing)
+    - chain_device_index: Device inside that chain (default 0)
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
+        params = {"track_index": track_index, "device_index": device_index}
+        missing = _device_address(params, chain_index, chain_device_index)
+        if missing:
+            return missing
         ableton = get_ableton_connection()
-        result = ableton.send_command(
-            "get_device_parameters",
-            {"track_index": track_index, "device_index": device_index},
-        )
+        result = ableton.send_command("get_device_parameters", params)
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error getting device parameters: {str(e)}")
@@ -728,40 +807,244 @@ def set_device_parameter(
     ctx: Context,
     track_index: int,
     device_index: int,
-    parameter_index: int,
     value: float,
+    parameter_index: Optional[int] = None,
+    parameter_name: Optional[str] = None,
+    chain_index: Optional[int] = None,
+    chain_device_index: Optional[int] = None,
     user_prompt: str = "",
 ) -> str:
     """
     Set a device parameter to a specific value.
 
-    Use get_device_parameters first to discover parameter indices and ranges.
+    Use get_device_parameters first to discover parameter names, indices and
+    ranges. Give exactly one of parameter_index or parameter_name. Devices
+    inside racks are addressed as in get_device_parameters (chain_index,
+    chain_device_index).
 
     Parameters:
     - track_index: Track that owns the device
     - device_index: Index into the track's device chain
+    - value: New parameter value (Live parameter units, within min..max)
     - parameter_index: Index into device.parameters
-    - value: New parameter value (Live parameter units)
+    - parameter_name: Parameter name instead of the index (case-insensitive exact match, e.g. "Filter Freq")
+    - chain_index: Chain inside the rack at device_index (optional; see Addressing)
+    - chain_device_index: Device inside that chain (default 0)
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
+        if (parameter_index is None) == (parameter_name is None):
+            raise ValueError("Give exactly one of parameter_index or parameter_name")
+        params: Dict[str, Any] = {
+            "track_index": track_index,
+            "device_index": device_index,
+            "value": value,
+        }
+        if parameter_name is not None:
+            from .script_handshake import require_capability
+
+            missing = require_capability("parameter_name_param")
+            if missing:
+                return missing
+            params["parameter_name"] = parameter_name
+        else:
+            params["parameter_index"] = parameter_index
+        missing = _device_address(params, chain_index, chain_device_index)
+        if missing:
+            return missing
         ableton = get_ableton_connection()
-        result = ableton.send_command(
-            "set_device_parameter",
-            {
-                "track_index": track_index,
-                "device_index": device_index,
-                "parameter_index": parameter_index,
-                "value": value,
-            },
-        )
+        result = ableton.send_command("set_device_parameter", params)
+        index = result.get("parameter_index", parameter_index)
+        index_note = f" (parameter {index})" if index is not None else ""
         return (
-            f"Set {result.get('name', 'parameter')} "
+            f"Set {result.get('name', 'parameter')}{index_note} "
             f"{result.get('old_value')} → {result.get('value')}"
         )
     except Exception as e:
         logger.error(f"Error setting device parameter: {str(e)}")
         return f"Error setting device parameter: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("get_rack_info")
+@trajectory_tool("get_rack_info")
+def get_rack_info(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    chain_index: Optional[int] = None,
+    chain_device_index: Optional[int] = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Inspect a rack (Instrument, Audio Effect, MIDI Effect or Drum Rack).
+
+    Returns its macros (parameter index, name, value, min, max), its chains
+    (index, name, mute, solo, and each chain's devices with index, name,
+    class_name, type, is_active, is_rack) and, for drum racks, the filled
+    pads (note, name, mute, solo, chain_indices). Use the chain and device
+    indices here as chain_index / chain_device_index in the other device
+    tools. Fails with not_a_rack for other devices.
+
+    Parameters:
+    - track_index: Track that owns the rack
+    - device_index: Index of the rack in the track's device chain
+    - chain_index: To inspect a rack nested inside a chain of that rack (optional)
+    - chain_device_index: Device inside that chain (default 0)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        params = {"track_index": track_index, "device_index": device_index}
+        missing = _device_address(params, chain_index, chain_device_index)
+        if missing:
+            return missing
+        result, missing = _send_gated("get_rack_info", params)
+        if missing:
+            return missing
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting rack info: {str(e)}")
+        return f"Error getting rack info: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_device_enabled")
+@trajectory_tool("set_device_enabled")
+def set_device_enabled(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    enabled: bool,
+    chain_index: Optional[int] = None,
+    chain_device_index: Optional[int] = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Turn a device on or off (its "Device On" switch).
+
+    Devices inside racks are addressed as in get_device_parameters.
+
+    Parameters:
+    - track_index: Track that owns the device
+    - device_index: Index into the track's device chain
+    - enabled: True to turn the device on, False to turn it off
+    - chain_index: Chain inside the rack at device_index (optional)
+    - chain_device_index: Device inside that chain (default 0)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        params = {"track_index": track_index, "device_index": device_index,
+                  "enabled": enabled}
+        missing = _device_address(params, chain_index, chain_device_index)
+        if missing:
+            return missing
+        result, missing = _send_gated("set_device_enabled", params)
+        if missing:
+            return missing
+        now_on = result.get("enabled", enabled)
+        out = (f"'{result.get('name', 'device')}' is now {'on' if now_on else 'off'} "
+               f"({_device_label(track_index, device_index, chain_index, chain_device_index)})")
+        if now_on and result.get("is_active") is False:
+            out += ("; Live reports it inactive, probably because the rack or "
+                    "track containing it is off")
+        return out
+    except Exception as e:
+        logger.error(f"Error setting device enabled: {str(e)}")
+        return f"Error setting device enabled: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("delete_device")
+@trajectory_tool("delete_device")
+def delete_device(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    chain_index: Optional[int] = None,
+    chain_device_index: Optional[int] = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Delete a device from a track, or from a chain inside a rack.
+
+    One undo step: the undo tool restores the device with its settings.
+    Devices inside racks are addressed as in get_device_parameters; without
+    chain_index the whole device at device_index (for a rack, the rack and
+    everything in it) is deleted.
+
+    Parameters:
+    - track_index: Track that owns the device
+    - device_index: Index into the track's device chain
+    - chain_index: Chain inside the rack at device_index (optional)
+    - chain_device_index: Device inside that chain (default 0)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        params = {"track_index": track_index, "device_index": device_index}
+        missing = _device_address(params, chain_index, chain_device_index)
+        if missing:
+            return missing
+        result, missing = _send_gated("delete_device", params)
+        if missing:
+            return missing
+        return (f"Deleted '{result.get('deleted', 'device')}' "
+                f"({_device_label(track_index, device_index, chain_index, chain_device_index)}). "
+                "Use undo to restore it.")
+    except Exception as e:
+        logger.error(f"Error deleting device: {str(e)}")
+        return f"Error deleting device: {str(e)}"
+
+
+_PRESET_DIRECTIONS = ("next", "previous", "current")
+
+
+@mcp.tool()
+@rich_telemetry_tool("navigate_device_preset")
+@trajectory_tool("navigate_device_preset")
+def navigate_device_preset(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    direction: str = "current",
+    chain_index: Optional[int] = None,
+    chain_device_index: Optional[int] = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Step through a plugin device's presets, or read the current one.
+
+    Only plugin devices (VST/AU) expose presets to scripts; Live's own devices
+    fail with not_supported. Changing presets is not an undo step. Devices
+    inside racks are addressed as in get_device_parameters.
+
+    Parameters:
+    - track_index: Track that owns the device
+    - device_index: Index into the track's device chain
+    - direction: "next", "previous" or "current" (read only)
+    - chain_index: Chain inside the rack at device_index (optional)
+    - chain_device_index: Device inside that chain (default 0)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        if direction not in _PRESET_DIRECTIONS:
+            raise ValueError(
+                f"direction must be one of {', '.join(_PRESET_DIRECTIONS)}, got {direction!r}")
+        params = {"track_index": track_index, "device_index": device_index,
+                  "direction": direction}
+        missing = _device_address(params, chain_index, chain_device_index)
+        if missing:
+            return missing
+        result, missing = _send_gated("navigate_device_preset", params)
+        if missing:
+            return missing
+        index = result.get("preset_index")
+        count = result.get("preset_count", "?")
+        position = f"{index + 1} of {count}" if isinstance(index, int) else f"? of {count}"
+        return (f"'{result.get('name', 'device')}' preset {position}: "
+                f"'{result.get('preset_name', '')}'")
+    except Exception as e:
+        logger.error(f"Error navigating device presets: {str(e)}")
+        return f"Error navigating device presets: {str(e)}"
 
 
 @mcp.tool()
@@ -1206,12 +1489,8 @@ def load_instrument_or_effect(ctx: Context, track_index: int, uri: str, user_pro
         
         # Check if the instrument was loaded successfully
         if result.get("loaded", False):
-            new_devices = result.get("new_devices", [])
-            if new_devices:
-                return f"Loaded instrument with URI '{uri}' on track {track_index}. New devices: {', '.join(new_devices)}"
-            else:
-                devices = result.get("devices_after", [])
-                return f"Loaded instrument with URI '{uri}' on track {track_index}. Devices on track: {', '.join(devices)}"
+            item = result.get("item_name") or uri
+            return f"Loaded '{item}' on track {track_index}. {_describe_load(result)}"
         else:
             return f"Failed to load instrument with URI '{uri}'"
     except Exception as e:
@@ -1924,7 +2203,8 @@ def load_drum_kit(ctx: Context, track_index: int, rack_uri: str, kit_path: str, 
             "item_uri": kit_uri
         })
         
-        return f"Loaded drum rack and kit '{loadable_kits[0].get('name')}' on track {track_index}"
+        return (f"Loaded drum rack and kit '{loadable_kits[0].get('name')}' on track "
+                f"{track_index}. {_describe_load(load_result)}")
     except Exception as e:
         logger.error(f"Error loading drum kit: {str(e)}")
         return f"Error loading drum kit: {str(e)}"
@@ -2199,7 +2479,9 @@ def cue_point(
         cue = result.get("cue")
         playhead = result.get("current_song_time")
         if action == "delete":
-            return f"Deleted cue '{cue.get('name')}' at beat {cue.get('time')}" if cue else "Deleted cue"
+            deleted = (f"Deleted cue '{cue.get('name')}' at beat {cue.get('time')}"
+                       if cue else "Deleted cue")
+            return deleted + _playhead_note(result)
         if cue:
             return f"Jumped to cue '{cue.get('name')}' at beat {cue.get('time')}"
         return f"Jumped to {action} cue; playhead at beat {playhead}"

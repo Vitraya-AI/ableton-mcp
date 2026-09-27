@@ -9,7 +9,7 @@ to the Remote Script.
 1. Run `ableton-mcp-install-script`, then restart Live.
 2. Open a fresh, empty Live set.
 3. Start the MCP server and call `get_remote_script_info`. Confirm it reports
-   script version 1.10.2 and `up_to_date: true`. Confirm `live_version` shows
+   script version 1.11.0 and `up_to_date: true`. Confirm `live_version` shows
    your Live build and `live_api` lists the version-dependent APIs (on Live 11
    expect `track_create_midi_clip: false`, `song_begin_undo_step: true`,
    `automation_envelope_insert_step: true`).
@@ -113,6 +113,37 @@ rebuild the test tracks after each update.
    on.
 10. Call `delete_clip` with `view="arrangement"` on the audio clip; confirm it
    is removed from the Arrangement only.
+
+## Devices and racks (1.11.0)
+
+Setup: a MIDI track with an Instrument Rack (e.g. load any preset from
+Instruments that is a rack, or group Drift + an effect with Cmd+G), a MIDI
+track with a Drum Rack kit (`load_drum_kit` or drag one in), and a track with
+a third-party plugin (VST/AU) if you have one.
+
+1. `load_instrument_or_effect` on an empty MIDI track: the reply names the
+   new device ("New devices: Drift"), not an empty list.
+2. `get_rack_info` on the Instrument Rack: chains, the devices in each chain,
+   and the visible macros with values. On a plain device: `not_a_rack`.
+3. `get_rack_info` on the Drum Rack: `is_drum_rack: true`, only filled pads,
+   and each pad's `chain_indices` is **not empty** (it maps pads to chains;
+   an empty list would mean Live objects don't compare equal as expected).
+4. `get_device_parameters` with `chain_index` / `chain_device_index` on a
+   device inside a rack chain — including the **second** device in a chain.
+   Quantized parameters (e.g. a filter type) list `value_items`.
+5. `set_device_parameter` on that chain device by `parameter_name` (e.g.
+   "Filter Freq" or whatever `get_device_parameters` shows): the knob moves
+   in Live. A wrong name gives `parameter_not_found`; an out-of-range value
+   gives `parameter_value_out_of_range` and nothing changes.
+6. `set_device_enabled` off, then on, for a top-level device and a chain
+   device: the device's on/off switch follows, and the reply matches.
+7. `delete_device` on a chain device: only that device goes. `undo` brings it
+   back in one step.
+8. `navigate_device_preset` on the plugin: `current`, then `next`, then
+   `previous` — the reply names the preset Live shows. On a Live device (e.g.
+   Drift): `not_supported`.
+9. Past-the-end playhead: repeat Arrangement step 2 with the playhead past the
+   end of the song; the note says where the playhead stopped (beat and bar).
 
 ## Scenes
 

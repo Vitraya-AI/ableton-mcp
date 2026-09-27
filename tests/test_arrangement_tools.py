@@ -596,3 +596,38 @@ def test_set_arrangement_time_reports_read_back(fake_conn):
 def test_set_arrangement_time_exact(fake_conn):
     fake_conn({"set_current_song_time": {"current_song_time": 8.0}})
     assert call(server.set_arrangement_time, None, 8.0) == "Playhead moved to beat 8.0"
+
+
+def test_playhead_note_says_where_it_stopped(fake_conn):
+    conn = fake_conn({"create_arrangement_midi_clip": {
+        "clip_index": 0, "name": "X", "start_time": 0.0, "end_time": 4.0, "note_count": 0,
+        "method": "create_midi_clip", "playhead_restored": False, "playhead_time": 232.0}})
+    out = call(server.create_arrangement_midi_clip, None, 0, start=0.0, length=4.0)
+    assert out.endswith("it stopped at beat 232 (bar 59), the end of the song.")
+    assert conn.commands() == ["create_arrangement_midi_clip", "get_session_info"]
+
+
+def test_playhead_note_in_3_4(fake_conn):
+    fake_conn({"create_locator": {"name": "A", "name_applied": True, "time": 0.0,
+                                  "playhead_restored": False, "playhead_time": 30.0}},
+              signature=(3, 4))
+    out = call(server.create_locator, None, "A", 0.0)
+    assert "it stopped at beat 30 (bar 11), the end of the song." in out
+
+
+def test_playhead_note_on_cue_delete(fake_conn):
+    fake_conn({"cue_point": {"action": "delete", "cue": {"name": "A", "time": 8.0},
+                             "current_song_time": 16.0, "playhead_restored": False,
+                             "playhead_time": 16.0}})
+    out = call(server.cue_point, None, "delete", name="A")
+    assert out.startswith("Deleted cue 'A' at beat 8.0")
+    assert "it stopped at beat 16 (bar 5), the end of the song." in out
+
+
+def test_playhead_note_without_time(fake_conn):
+    conn = fake_conn({"create_arrangement_audio_clip": {
+        "clip_index": 0, "name": "loop", "start_time": 0.0, "end_time": 8.0,
+        "length": 8.0, "playhead_restored": False}})
+    out = call(server.create_arrangement_audio_clip, None, 2, "/tmp/loop.wav", start=0.0)
+    assert out.endswith("it stopped at the end of the song.")
+    assert conn.commands() == ["create_arrangement_audio_clip"]

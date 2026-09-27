@@ -1,6 +1,6 @@
 # Extended Features Port — Plan
 
-Status: **Phases 0–1 done (Remote Script 1.10.2); awaiting a final Live re-check of Arrangement steps 2, 6, 7, 8; next is Phase 2** (written 2026-09-26). Work happens on the
+Status: **Phases 0–2 implemented (Remote Script 1.11.0). Phases 0–1 verified in Live 11.3.43; Phase 2 awaiting the "Devices and racks (1.11.0)" Live checks. After that: README update, then Phases 3–4 if wanted** (written 2026-09-26). Work happens on the
 `extended-features` branch. This document is the hand-off: a new session should
 be able to start Phase 0 from here without the conversation that produced it.
 
@@ -133,7 +133,8 @@ is clamped to the song length and never fails a successful edit (it failed
 with "Cannot set the Songtime behind the Songlength" after the song
 shrank); `create_arrangement_audio_clip` restores the playhead;
 `set_arrangement_time` reports where Live actually put it.
-**Still to do in Live:** "Arrangement (1.10.2)" steps 2, 6, 7, 8.
+Re-test of 1.10.2 (2026-09-27): all Arrangement checks pass on Live 11.3.43.
+Phase 1 complete.
 
 **Rule for new commands:** anything that writes a Live property and then
 depends on it in the same command (playhead, loop, markers…) must be a
@@ -156,7 +157,17 @@ time), matching `get_arrangement_clips`.
 | `create_arrangement_audio_clip(track_index, path, start / start_bar)` | `Track.create_audio_clip` exists on 11.3.43, so arrangement audio clips are possible. Was out of scope only because it looked Live-12-only. Returns the new clip's arrangement index (Live returns None, so find it by start time). |
 | `set_clip_properties(track_index, clip_index, properties, view="session")` (new) | Sets several properties in one call from an allowlist: `name`, `muted`, `color`, `looping`, `loop_start`, `loop_end`, `start_marker`, `end_marker`, `gain`, `pitch_coarse`, `pitch_fine`, `warping`, `warp_mode`. Audio-only keys (`gain`, `pitch_*`, `warp*`) error with a clear code on MIDI clips. Unknown keys → `invalid_value` listing the allowed ones. Returns the values read back. |
 
-## Phase 2 — Devices and racks (Remote Script 1.11.0)
+## Phase 2 — Devices and racks ✅ implemented (Remote Script 1.11.0)
+
+Implemented to the table below plus: `set_device_parameter` accepts
+`parameter_name` (capability `parameter_name_param`) and waits for Live
+before reading back; quantized parameters list `value_items`; chain
+addressing is gated on capability `device_chain_param` so an older script
+can't act on the outer device. Phase 1 loose ends folded in:
+`load_browser_item` waits for the device list to change and reports
+`new_devices`; playhead-restore results carry `playhead_time`. Drum pads map
+to `rack.chains` with `==` (Live hands out new wrappers per read) — verify
+in Live (smoke check 3). Tool list: 60 tools, ~12.7k tokens.
 
 **Device addressing inside racks.** Add optional `chain_index` and
 `chain_device_index` to `get_device_parameters`, `set_device_parameter`,

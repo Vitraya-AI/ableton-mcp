@@ -35,7 +35,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.10.2"
+SCRIPT_VERSION = "1.11.0"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -88,6 +88,16 @@ SCRIPT_CAPABILITIES = [
     # view="arrangement". Older scripts would ignore it and act on a Session
     # clip, so the server refuses the view without this.
     "clip_view_param",
+    "get_rack_info",
+    "set_device_enabled",
+    "delete_device",
+    "navigate_device_preset",
+    # Flags, not commands: device commands understand chain_index /
+    # chain_device_index, and set_device_parameter understands parameter_name.
+    # An older script would ignore them and act on the outer device or the
+    # wrong parameter, so the server refuses them without these.
+    "device_chain_param",
+    "parameter_name_param",
     "error_codes",
 ]
 
@@ -367,6 +377,7 @@ class AbletonMCP(ControlSurface):
         "duplicate_session_clip_to_arrangement", "create_locator", "map_rack_magnitude",
         "set_arrangement_loop", "create_arrangement_midi_clip",
         "create_arrangement_audio_clip", "set_clip_properties",
+        "set_device_enabled", "delete_device",
     ])
 
     def _read_handlers(self, params):
@@ -385,7 +396,11 @@ class AbletonMCP(ControlSurface):
                 p("track_index", 0), p("clip_index", 0), p("view", None)),
             "get_arrangement_info": lambda: self._get_arrangement_info(),
             "get_device_parameters": lambda: self._get_device_parameters(
-                p("track_index", 0), p("device_index", 0)),
+                p("track_index", 0), p("device_index", 0),
+                p("chain_index", None), p("chain_device_index", None)),
+            "get_rack_info": lambda: self._get_rack_info(
+                p("track_index", 0), p("device_index", 0),
+                p("chain_index", None), p("chain_device_index", None)),
             "get_session_snapshot": lambda: self._get_session_snapshot(
                 include_notes=p("include_notes", True),
                 include_params=p("include_params", True)),
@@ -443,7 +458,18 @@ class AbletonMCP(ControlSurface):
             "set_master_panning": lambda: self._set_master_panning(p("value", 0.0)),
             "set_device_parameter": lambda: self._set_device_parameter(
                 p("track_index", 0), p("device_index", 0),
-                p("parameter_index", 0), p("value", 0.0)),
+                p("parameter_index", None), p("value", 0.0),
+                p("parameter_name", None),
+                p("chain_index", None), p("chain_device_index", None)),
+            "set_device_enabled": lambda: self._set_device_enabled(
+                p("track_index", 0), p("device_index", 0), p("enabled", True),
+                p("chain_index", None), p("chain_device_index", None)),
+            "delete_device": lambda: self._delete_device(
+                p("track_index", 0), p("device_index", 0),
+                p("chain_index", None), p("chain_device_index", None)),
+            "navigate_device_preset": lambda: self._navigate_device_preset(
+                p("track_index", 0), p("device_index", 0), p("direction", None),
+                p("chain_index", None), p("chain_device_index", None)),
             "create_scene": lambda: self._create_scene(p("index", -1)),
             "fire_scene": lambda: self._fire_scene(p("scene_index", 0)),
             "delete_scene": lambda: self._delete_scene(p("scene_index", 0)),
@@ -1822,6 +1848,7 @@ class AbletonMCP(ControlSurface):
             }
             if restored is not None:
                 result["playhead_restored"] = restored
+                result["playhead_time"] = float(song.current_song_time)
             return result
         except Exception as e:
             self.log_message("Error creating locator: " + str(e))
@@ -2014,6 +2041,7 @@ class AbletonMCP(ControlSurface):
         }
         if action == "delete":
             result["playhead_restored"] = restored
+            result["playhead_time"] = float(song.current_song_time)
         return result
 
     def _delete_cue(self, cue_time):
@@ -2184,6 +2212,7 @@ class AbletonMCP(ControlSurface):
                 "note_count": len(notes),
                 "method": method,
                 "playhead_restored": restored,
+                "playhead_time": float(self._song.current_song_time),
             }
         except Exception as e:
             self.log_message("Error creating arrangement MIDI clip: " + str(e))
@@ -2235,6 +2264,7 @@ class AbletonMCP(ControlSurface):
                 "end_time": float(clip.end_time),
                 "length": float(clip.length),
                 "playhead_restored": restored,
+                "playhead_time": float(self._song.current_song_time),
             }
         except Exception as e:
             self.log_message("Error creating arrangement audio clip: " + str(e))
@@ -2318,6 +2348,223 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error setting clip properties: " + str(e))
             raise
+
+    # ── Devices and racks ───────────────────────────────────────────────────
+
+    def _locate_device(self, track_index, device_index,
+                       chain_index=None, chain_device_index=None):
+        """(device, owner, index): the addressed device, the track or rack
+        chain holding it, and its index there (for owner.delete_device).
+
+        chain_index addresses a chain of the rack at device_index, and
+        chain_device_index (default 0) a device in that chain. One level of
+        nesting only.
+        """
+        if chain_index is None and chain_device_index is not None:
+            raise CommandError(
+                "chain_device_index needs chain_index", "invalid_value")
+        track = self._get_track(track_index)
+        devices = list(track.devices)
+        device_index = int(device_index)
+        if device_index < 0 or device_index >= len(devices):
+            raise CommandError(
+                "Device index out of range (track has %d devices)" % len(devices),
+                "device_index_out_of_range")
+        device = devices[device_index]
+        if chain_index is None:
+            return device, track, device_index
+
+        if not getattr(device, "can_have_chains", False):
+            raise CommandError("Device '%s' is not a rack" % device.name, "not_a_rack")
+        chains = list(device.chains)
+        chain_index = int(chain_index)
+        if chain_index < 0 or chain_index >= len(chains):
+            raise CommandError(
+                "Chain index out of range (rack '%s' has %d chains)"
+                % (device.name, len(chains)), "chain_index_out_of_range")
+        chain = chains[chain_index]
+        chain_devices = list(chain.devices)
+        index = int(chain_device_index or 0)
+        if index < 0 or index >= len(chain_devices):
+            raise CommandError(
+                "Device index out of range (chain '%s' has %d devices)"
+                % (chain.name, len(chain_devices)), "device_index_out_of_range")
+        return chain_devices[index], chain, index
+
+    def _resolve_device(self, track_index, device_index,
+                        chain_index=None, chain_device_index=None):
+        return self._locate_device(
+            track_index, device_index, chain_index, chain_device_index)[0]
+
+    def _resolve_parameter_index(self, device, parameter_index=None, parameter_name=None):
+        """Index of the parameter given by index or by (case-insensitive) name."""
+        params = list(device.parameters)
+        if (parameter_index is None) == (parameter_name is None):
+            raise CommandError(
+                "Give exactly one of parameter_index and parameter_name", "invalid_value")
+        if parameter_index is not None:
+            parameter_index = int(parameter_index)
+            if parameter_index < 0 or parameter_index >= len(params):
+                raise CommandError(
+                    "Parameter index out of range (device has %d parameters)" % len(params),
+                    "parameter_index_out_of_range")
+            return parameter_index
+        wanted = str(parameter_name).lower()
+        matches = [i for i, param in enumerate(params) if str(param.name).lower() == wanted]
+        if not matches:
+            names = [str(param.name) for param in params]
+            more = " ..." if len(names) > 20 else ""
+            raise CommandError(
+                "No parameter named '%s' on '%s'. Parameters: %s%s"
+                % (parameter_name, device.name, ", ".join(names[:20]), more),
+                "parameter_not_found")
+        if len(matches) > 1:
+            raise CommandError(
+                "Several parameters are named '%s' (indices %s); use parameter_index"
+                % (parameter_name, matches), "invalid_value")
+        return matches[0]
+
+    def _get_rack_info(self, track_index, device_index,
+                       chain_index=None, chain_device_index=None):
+        """Macros, chains (with their devices) and filled drum pads of a rack."""
+        rack = self._resolve_device(track_index, device_index, chain_index, chain_device_index)
+        if not getattr(rack, "can_have_chains", False):
+            raise CommandError("Device '%s' is not a rack" % rack.name, "not_a_rack")
+
+        params = list(rack.parameters)
+        macro_count = int(getattr(rack, "visible_macro_count", 8))
+        macros = []
+        # parameters[0] is "Device On"; the macros follow it.
+        for index in range(1, min(1 + macro_count, len(params))):
+            param = params[index]
+            macros.append({
+                "index": index,
+                "name": str(param.name),
+                "value": float(param.value),
+                "min": float(param.min),
+                "max": float(param.max),
+            })
+
+        rack_chains = list(rack.chains)
+        chains = []
+        for c_index, chain in enumerate(rack_chains):
+            devices = []
+            for d_index, device in enumerate(chain.devices):
+                devices.append({
+                    "index": d_index,
+                    "name": str(device.name),
+                    "class_name": str(device.class_name),
+                    "type": self._get_device_type(device),
+                    "is_active": bool(getattr(device, "is_active", True)),
+                    "is_rack": bool(getattr(device, "can_have_chains", False)),
+                })
+            chains.append({
+                "index": c_index,
+                "name": str(chain.name),
+                "mute": bool(getattr(chain, "mute", False)),
+                "solo": bool(getattr(chain, "solo", False)),
+                "devices": devices,
+            })
+
+        is_drum_rack = bool(getattr(rack, "can_have_drum_pads", False))
+        drum_pads = []
+        if is_drum_rack:
+            for pad in rack.drum_pads:
+                pad_chains = list(pad.chains)
+                if not pad_chains:
+                    continue
+                drum_pads.append({
+                    "note": int(pad.note),
+                    "name": str(pad.name),
+                    "mute": bool(pad.mute),
+                    "solo": bool(pad.solo),
+                    # Live hands out a new wrapper per access, so compare with
+                    # == (same underlying chain) rather than `is`.
+                    "chain_indices": [i for i, chain in enumerate(rack_chains)
+                                      if any(chain == pc for pc in pad_chains)],
+                })
+
+        return {
+            "track_index": track_index,
+            "device_index": device_index,
+            "chain_index": chain_index,
+            "chain_device_index": chain_device_index,
+            "name": str(rack.name),
+            "class_name": str(rack.class_name),
+            "is_drum_rack": is_drum_rack,
+            "macros": macros,
+            "chains": chains,
+            "drum_pads": drum_pads,
+        }
+
+    def _device_on_parameter(self, device):
+        params = list(device.parameters)
+        if params:
+            param = params[0]
+            name = getattr(param, "original_name", None) or param.name
+            if str(name) == "Device On":
+                return param
+        raise CommandError(
+            "'%s' has no 'Device On' parameter" % device.name, "not_supported")
+
+    def _set_device_enabled(self, track_index, device_index, enabled,
+                            chain_index=None, chain_device_index=None):
+        """Turn a device on or off through its "Device On" parameter
+        (Device.is_active is read-only). A generator: reads back after a tick."""
+        device = self._resolve_device(track_index, device_index, chain_index, chain_device_index)
+        param = self._device_on_parameter(device)
+        param.value = param.max if enabled else param.min
+        yield
+        return {
+            "name": str(device.name),
+            "enabled": float(param.value) == float(param.max),
+            "is_active": bool(getattr(device, "is_active", True)),
+        }
+
+    def _delete_device(self, track_index, device_index,
+                       chain_index=None, chain_device_index=None):
+        device, owner, index = self._locate_device(
+            track_index, device_index, chain_index, chain_device_index)
+        name = str(device.name)
+        owner.delete_device(index)
+        return {
+            "deleted": name,
+            "track_index": track_index,
+            "device_index": device_index,
+            "chain_index": chain_index,
+            "chain_device_index": chain_device_index,
+        }
+
+    def _navigate_device_preset(self, track_index, device_index, direction,
+                                chain_index=None, chain_device_index=None):
+        """Step through a plugin device's presets. A generator: reads back
+        after a tick. Not undoable (Live does not record preset changes)."""
+        if direction not in ("next", "previous", "current"):
+            raise CommandError(
+                "direction must be 'next', 'previous' or 'current' (got: %s)"
+                % (direction,), "invalid_value")
+        device = self._resolve_device(track_index, device_index, chain_index, chain_device_index)
+        presets = getattr(device, "presets", None)
+        presets = list(presets) if presets is not None else []
+        if not presets:
+            raise CommandError("'%s' has no presets" % device.name, "not_supported")
+
+        current = int(device.selected_preset_index)
+        if direction != "current":
+            step = 1 if direction == "next" else -1
+            target = min(max(current + step, 0), len(presets) - 1)
+            if target != current:
+                device.selected_preset_index = target
+                yield
+
+        index = int(device.selected_preset_index)
+        presets = list(device.presets)
+        return {
+            "name": str(device.name),
+            "preset_index": index,
+            "preset_name": str(presets[index]) if 0 <= index < len(presets) else None,
+            "preset_count": len(presets),
+        }
 
     # ── Browser implementations ───────────────────────────────────────────────
 
@@ -2419,6 +2666,9 @@ class AbletonMCP(ControlSurface):
         """
         return self._load_browser_item(track_index, uri)
 
+    # Ticks to wait for a loaded device to appear (Live loads asynchronously).
+    _LOAD_WAIT_TICKS = 30
+
     def _load_browser_item(self, track_index, item_uri):
         """Load a browser item onto a track by its URI"""
         try:
@@ -2438,17 +2688,46 @@ class AbletonMCP(ControlSurface):
             
             # Select the track
             self._song.view.selected_track = track
-            
-            # Load the item
+
+            before = list(track.devices)
+            before_names = [str(d.name) for d in before]
+
+            # Load the item. Live adds the device on a later tick, so wait for
+            # the device list to change before reporting it.
             app.browser.load_item(item)
-            
-            result = {
+
+            def current():
+                return list(track.devices)
+
+            def changed():
+                after = current()
+                if len(after) != len(before):
+                    return True
+                return any(not (a == b) for a, b in zip(after, before))
+
+            ticks = 0
+            while ticks < self._LOAD_WAIT_TICKS and not changed():
+                yield
+                ticks += 1
+
+            after = current()
+            new_devices = [str(d.name) for d in after
+                           if not any(d == b for b in before)]
+            devices_after = [str(d.name) for d in after]
+            devices_changed = changed()
+            self.log_message(
+                "load_browser_item: %s on '%s': devices %s -> %s after %d ticks "
+                "(changed=%s)" % (item_uri, track.name, before_names, devices_after,
+                                  ticks, devices_changed))
+            return {
                 "loaded": True,
                 "item_name": item.name,
                 "track_name": track.name,
-                "uri": item_uri
+                "uri": item_uri,
+                "new_devices": new_devices,
+                "devices_after": devices_after,
+                "devices_changed": devices_changed,
             }
-            return result
         except Exception as e:
             self.log_message("Error loading browser item: {0}".format(str(e)))
             self.log_message(traceback.format_exc())
@@ -3063,7 +3342,8 @@ class AbletonMCP(ControlSurface):
     # a snapshot can never blow the stack or the payload size.
     _MAX_CHAIN_DEPTH = 4
 
-    def _serialize_device(self, device, device_index, include_params=True, depth=0):
+    def _serialize_device(self, device, device_index, include_params=True, depth=0,
+                          include_value_items=False):
         info = {
             "index": device_index,
             "name": device.name,
@@ -3093,6 +3373,12 @@ class AbletonMCP(ControlSurface):
                         }
                         if hasattr(param, "value_string"):
                             entry["value_string"] = str(param.value_string)
+                        if include_value_items and entry["is_quantized"]:
+                            # Named switch positions; raises when not quantized.
+                            try:
+                                entry["value_items"] = [str(v) for v in param.value_items]
+                            except Exception:
+                                pass
                         if hasattr(param, "automation_state"):
                             try:
                                 entry["automation_state"] = int(param.automation_state)
@@ -3319,17 +3605,16 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting clip notes: " + str(e))
             raise
 
-    def _get_device_parameters(self, track_index, device_index):
+    def _get_device_parameters(self, track_index, device_index,
+                               chain_index=None, chain_device_index=None):
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            track = self._song.tracks[track_index]
-            if device_index < 0 or device_index >= len(track.devices):
-                raise IndexError("Device index out of range")
-            device = track.devices[device_index]
+            device = self._resolve_device(
+                track_index, device_index, chain_index, chain_device_index)
+            index = device_index if chain_index is None else (chain_device_index or 0)
             return {
                 "track_index": track_index,
-                "device": self._serialize_device(device, device_index, include_params=True),
+                "device": self._serialize_device(
+                    device, index, include_params=True, include_value_items=True),
             }
         except Exception as e:
             self.log_message("Error getting device parameters: " + str(e))
@@ -3411,16 +3696,16 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting session snapshot: " + str(e))
             raise
 
-    def _set_device_parameter(self, track_index, device_index, parameter_index, value):
+    def _set_device_parameter(self, track_index, device_index, parameter_index=None,
+                              value=0.0, parameter_name=None,
+                              chain_index=None, chain_device_index=None):
+        """Set one parameter, addressed by index or by name. A generator: the
+        value is read back after Live has applied it."""
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            track = self._song.tracks[track_index]
-            if device_index < 0 or device_index >= len(track.devices):
-                raise IndexError("Device index out of range")
-            device = track.devices[device_index]
-            if parameter_index < 0 or parameter_index >= len(device.parameters):
-                raise IndexError("Parameter index out of range")
+            device = self._resolve_device(
+                track_index, device_index, chain_index, chain_device_index)
+            parameter_index = self._resolve_parameter_index(
+                device, parameter_index, parameter_name)
             param = device.parameters[parameter_index]
             # Live silently clamps out-of-range values, which hides mistakes.
             value = self._check_range(
@@ -3429,6 +3714,9 @@ class AbletonMCP(ControlSurface):
                 code="parameter_value_out_of_range")
             old = float(param.value)
             param.value = value
+            yield from self._wait_for(
+                lambda: abs(float(param.value) - value) < 1e-6,
+                max_ticks=3, raise_on_timeout=False)
             return {
                 "track_index": track_index,
                 "device_index": device_index,

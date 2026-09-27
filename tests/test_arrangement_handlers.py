@@ -596,7 +596,8 @@ def test_midi_clip_live11_session_fallback(script):
                     track_index=0, start=8.0, length=4.0, notes=NOTES, name="Hook"))
     assert result == {"track_index": 0, "clip_index": 1, "name": "Hook",
                       "start_time": 8.0, "end_time": 12.0, "note_count": 2,
-                      "method": "session_fallback", "playhead_restored": True}
+                      "method": "session_fallback", "playhead_restored": True,
+                      "playhead_time": 0.0}
     new = track.arrangement_clips[1]
     assert [(n.pitch, n.start_time) for n in new.notes] == [(60, 0.0), (64, 1.0)]
     # The temporary Session clip is gone; the occupied slot is untouched.
@@ -723,7 +724,7 @@ def test_audio_clip(script, wav):
     assert track.imports == [(wav, 16.0)]
     assert result == {"track_index": 0, "clip_index": 1, "name": "sample",
                       "start_time": 16.0, "end_time": 24.0, "length": 8.0,
-                      "playhead_restored": True}
+                      "playhead_restored": True, "playhead_time": 0.0}
     assert song.undo_steps == ["begin", "end"]
 
 
@@ -973,7 +974,7 @@ def test_create_locator_toggles_at_the_target_not_the_old_playhead(script):
     result = ok(run(make_instance(script, song), "create_locator", name="Intro", time=0.0))
     assert result == {"success": True, "time": 0.0, "name": "Intro",
                       "requested_name": "Intro", "name_applied": True,
-                      "playhead_restored": True}
+                      "playhead_restored": True, "playhead_time": 32.0}
     assert [(c.name, c.time) for c in song.cue_points] == [("Intro", 0.0)]
     assert song.current_song_time == 32.0
     assert song.events.count("toggle") == 1
@@ -1187,6 +1188,7 @@ def test_midi_clip_succeeds_when_the_song_shrinks_below_the_old_playhead(script)
                     track_index=0, start=16.0, length=4.0))
     assert result["clip_index"] == 0
     assert result["playhead_restored"] is False
+    assert result["playhead_time"] == 232.0
     assert song.current_song_time == 232.0
     assert song.undo_steps == ["begin", "end"]
 

@@ -62,6 +62,9 @@ MODIFYING_TOOLS = {
     "create_arrangement_midi_clip",
     "create_arrangement_audio_clip",
     "set_clip_properties",
+    "set_device_enabled",
+    "delete_device",
+    "navigate_device_preset",
 }
 
 _PARAM_KEYS = (
@@ -112,6 +115,10 @@ _PARAM_KEYS = (
     "allow_overlap",
     "enabled",
     "bar",
+    "chain_index",
+    "chain_device_index",
+    "parameter_name",
+    "direction",
 )
 
 # A `path` ending in one of these is a file on disk, not a Live browser category.
