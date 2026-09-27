@@ -511,3 +511,88 @@ def test_set_clip_properties_reports_read_back(fake_conn):
     fake_conn({"set_clip_properties": {"properties": {"loop_end": 8.0}}})
     out = call(server.set_clip_properties, None, 0, 0, {"loop_end": 7.99})
     assert out.endswith('{"loop_end": 8.0}')
+
+
+# --------------------------------------------------------------------------
+# Locator names on Live 11, playhead restore, set_arrangement_time read-back
+# --------------------------------------------------------------------------
+
+def test_create_locator_name_not_applied(fake_conn):
+    conn = fake_conn({"create_locator": {"name": "1", "requested_name": "Chorus",
+                                         "name_applied": False, "time": 16.0}},
+                     signature=(4, 4))
+    out = call(server.create_locator, None, "Chorus", 16.0)
+    assert conn.commands() == ["create_locator", "get_session_info"]
+    assert "beat 16.0 / bar 5" in out
+    assert "doesn't let scripts rename locators" in out
+    assert "named '1' instead of 'Chorus'" in out
+    assert "cue_point can jump to it by the name '1'" in out
+    assert not out.startswith("Locator '1' set")
+
+
+def test_create_locator_name_not_applied_without_signature(fake_conn):
+    conn = fake_conn({"create_locator": {"name": "2", "requested_name": "Drop",
+                                         "name_applied": False, "time": 6.0}})
+    conn.responses["get_session_info"] = {}
+    out = call(server.create_locator, None, "Drop", 6.0)
+    assert "created at beat 6.0," in out
+    assert "bar" not in out.split(",")[0]
+
+
+def test_create_locator_name_applied(fake_conn):
+    conn = fake_conn({"create_locator": {"name": "Chorus", "requested_name": "Chorus",
+                                         "name_applied": True, "time": 16.0,
+                                         "playhead_restored": True}})
+    out = call(server.create_locator, None, "Chorus", 16.0)
+    assert out == "Locator 'Chorus' set at beat 16.0"
+    assert conn.commands() == ["create_locator"]
+
+
+def test_docstrings_mention_live_12_renaming():
+    assert "Live 12" in server.create_locator.__doc__
+    assert "Live 12" in server.cue_point.__doc__
+
+
+PLAYHEAD_NOTE = "playhead could not be moved back"
+
+
+@pytest.mark.parametrize("restored, expect_note", [(False, True), (True, False), (None, False)])
+def test_playhead_note_midi_clip(fake_conn, restored, expect_note):
+    result = {"clip_index": 0, "name": "X", "start_time": 0.0, "end_time": 4.0,
+              "note_count": 0, "method": "create_midi_clip"}
+    if restored is not None:
+        result["playhead_restored"] = restored
+    fake_conn({"create_arrangement_midi_clip": result})
+    out = call(server.create_arrangement_midi_clip, None, 0, start=0.0, length=4.0)
+    assert (PLAYHEAD_NOTE in out) == expect_note
+    assert "(method: create_midi_clip)" in out
+
+
+@pytest.mark.parametrize("restored, expect_note", [(False, True), (True, False)])
+def test_playhead_note_audio_clip(fake_conn, restored, expect_note):
+    fake_conn({"create_arrangement_audio_clip": {
+        "clip_index": 0, "name": "loop", "start_time": 0.0, "end_time": 8.0,
+        "length": 8.0, "playhead_restored": restored}})
+    out = call(server.create_arrangement_audio_clip, None, 2, "/tmp/loop.wav", start=0.0)
+    assert (PLAYHEAD_NOTE in out) == expect_note
+
+
+@pytest.mark.parametrize("restored, expect_note", [(False, True), (True, False)])
+def test_playhead_note_locator(fake_conn, restored, expect_note):
+    fake_conn({"create_locator": {"name": "Chorus", "name_applied": True, "time": 400.0,
+                                  "playhead_restored": restored}})
+    out = call(server.create_locator, None, "Chorus", 400.0)
+    assert (PLAYHEAD_NOTE in out) == expect_note
+
+
+def test_set_arrangement_time_reports_read_back(fake_conn):
+    conn = fake_conn({"set_current_song_time": {"current_song_time": 32.0}})
+    out = call(server.set_arrangement_time, None, 40.0)
+    assert conn.sent == [("set_current_song_time", {"time": 40.0})]
+    assert out.startswith("Playhead moved to beat 32.0")
+    assert "requested 40.0" in out
+
+
+def test_set_arrangement_time_exact(fake_conn):
+    fake_conn({"set_current_song_time": {"current_song_time": 8.0}})
+    assert call(server.set_arrangement_time, None, 8.0) == "Playhead moved to beat 8.0"

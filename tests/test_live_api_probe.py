@@ -21,7 +21,7 @@ FLAGS = (
     "track_create_midi_clip", "track_create_audio_clip",
     "clip_slot_create_audio_clip", "song_begin_undo_step",
     "clip_automation_envelope", "automation_envelope_insert_step",
-    "envelope_insert_step", "plugin_device_presets",
+    "envelope_insert_step", "plugin_device_presets", "cue_point_set_name",
 )
 
 
@@ -120,6 +120,9 @@ def fake_live_11():
     class CuePoint(object):
         """A locator."""
 
+        # Live 11: Get/Listen only.
+        name = property(lambda self: "1", doc="Get/Listen to the name.")
+
         def jump(self):
             """jump( (CuePoint)arg1) -> None"""
 
@@ -183,6 +186,7 @@ def test_script_info_reports_live_version_and_flags(script, live):
         "automation_envelope_insert_step": True,
         "envelope_insert_step": False,
         "plugin_device_presets": True,
+        "cue_point_set_name": False,
     }
 
 
@@ -195,11 +199,20 @@ def test_script_info_flags_follow_the_live_build(script, live):
 
     live.Envelope = _module("Envelope", Envelope=Envelope)
     del live.PluginDevice
+    cue_point = live.Song.CuePoint
+    cue_point.name = property(lambda self: "1", lambda self, value: None)
     flags = run(make_instance(script), "get_script_info")["result"]["live_api"]
     assert flags["track_create_midi_clip"] is True
     assert flags["envelope_insert_step"] is True
     assert flags["plugin_device_presets"] is False
+    assert flags["cue_point_set_name"] is True
     assert set(flags) == set(FLAGS)
+
+
+def test_cue_point_set_name_false_without_cue_point_class(script, live):
+    del live.Song.CuePoint
+    flags = run(make_instance(script), "get_script_info")["result"]["live_api"]
+    assert flags["cue_point_set_name"] is False
 
 
 def test_script_info_without_live_module(script, no_live):

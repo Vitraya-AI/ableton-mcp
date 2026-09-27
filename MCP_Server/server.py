@@ -514,6 +514,14 @@ def _bar_or_none(beat, numerator: int, denominator: int):
         return None
 
 
+def _playhead_note(result: Dict[str, Any]) -> str:
+    """Sentence to append when Live could not put the playhead back."""
+    if result.get("playhead_restored") is False:
+        return (" Note: the playhead could not be moved back to where it was "
+                "(it was past the end of the song).")
+    return ""
+
+
 def _bars_or_none(beats, numerator: int, denominator: int):
     """A duration in beats expressed in bars (4 beats = 1 bar in 4/4), or None."""
     try:
@@ -1955,7 +1963,14 @@ def set_arrangement_time(ctx: Context, time: float, user_prompt: str = "") -> st
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("set_current_song_time", {"time": time})
-        return f"Playhead moved to beat {result.get('current_song_time', time)}"
+        actual = result.get("current_song_time", time)
+        out = f"Playhead moved to beat {actual}"
+        try:
+            if abs(float(actual) - float(time)) > 1e-6:
+                out += f" (requested {time}; Live placed it here)"
+        except (TypeError, ValueError):
+            pass
+        return out
     except Exception as e:
         logger.error(f"Error setting arrangement time: {str(e)}")
         return f"Error setting arrangement time: {str(e)}"
@@ -2048,8 +2063,12 @@ def create_locator(
     renamed instead of toggled off. Time is in beats from the start of the
     arrangement (e.g. 0.0 = start, 16.0 = bar 5 in 4/4).
 
+    Naming needs Live 12: Live 11 does not let scripts rename locators, so
+    there the locator keeps Live's default name (a number) and the output
+    says so. cue_point can jump to it by that name or by its time.
+
     Parameters:
-    - name: The locator label (e.g. "Chorus", "Verse 1", "Drop")
+    - name: The locator label (e.g. "Chorus", "Verse 1", "Drop"); applied on Live 12 only
     - time: Beat position where the locator should sit
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
@@ -2064,10 +2083,27 @@ def create_locator(
             "create_locator",
             {"name": name, "time": time}
         )
-        return (
-            f"Locator '{result.get('name', name)}' set at beat "
-            f"{result.get('time', time)}"
-        )
+        actual_name = result.get("name", name)
+        actual_time = result.get("time", time)
+        if result.get("name_applied") is False:
+            where = f"beat {actual_time}"
+            try:
+                num, den = _time_signature_for(actual_time)
+                bar = _bar_or_none(actual_time, num, den)
+                if bar is not None:
+                    where += f" / bar {bar:g}"
+            except Exception:
+                pass
+            requested = result.get("requested_name", name)
+            out = (
+                f"Locator created at {where}, but this Live version doesn't let "
+                f"scripts rename locators (Live 12 does), so it is named "
+                f"'{actual_name}' instead of '{requested}'. cue_point can jump "
+                f"to it by the name '{actual_name}'."
+            )
+        else:
+            out = f"Locator '{actual_name}' set at beat {actual_time}"
+        return out + _playhead_note(result)
     except Exception as e:
         logger.error(f"Error creating locator: {str(e)}")
         return f"Error creating locator: {str(e)}"
@@ -2144,7 +2180,9 @@ def cue_point(
     - action: "jump" (to the cue named `name`, or the one nearest `time`/`bar`),
       "next", "previous", or "delete" (the cue named `name`, or the one at
       `time`/`bar`). Deleting leaves the playhead where it was.
-    - name: Cue name (case-insensitive exact match)
+    - name: Cue name (case-insensitive exact match). On Live 11 locators
+      created by scripts keep Live's default names (numbers), because only
+      Live 12 lets scripts rename them; get_arrangement_info lists the names.
     - time: Position in beats
     - bar: Position as a bar number instead of time (bar 1 = beat 0; 2.5 = half way through bar 2)
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
@@ -2282,7 +2320,7 @@ def create_arrangement_midi_clip(
             f"{result.get('end_time', start + length)}, arrangement clip index "
             f"{result.get('clip_index', '?')}, {result.get('note_count', len(parsed_notes))} "
             f"note(s){via}"
-        )
+        ) + _playhead_note(result)
     except Exception as e:
         logger.error(f"Error creating arrangement MIDI clip: {str(e)}")
         return f"Error creating arrangement MIDI clip: {str(e)}"
@@ -2334,7 +2372,7 @@ def create_arrangement_audio_clip(
             f"{track_index}, beats {result.get('start_time', start)}-{result.get('end_time', '?')} "
             f"(length {result.get('length', '?')} beats), arrangement clip index "
             f"{result.get('clip_index', '?')}"
-        )
+        ) + _playhead_note(result)
     except Exception as e:
         logger.error(f"Error creating arrangement audio clip: {str(e)}")
         return f"Error creating arrangement audio clip: {str(e)}"

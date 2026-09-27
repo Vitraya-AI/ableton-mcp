@@ -35,7 +35,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.10.1"
+SCRIPT_VERSION = "1.10.2"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -697,6 +697,13 @@ class AbletonMCP(ControlSurface):
                 flags[flag] = bool(hasattr(klass, attr))
             except Exception:
                 flags[flag] = False
+        # CuePoint.name is read-only on Live 11 ("Get/Listen") and settable on
+        # Live 12, so check for a setter rather than the attribute.
+        try:
+            prop = self._static_class_attr(Live.Song.CuePoint, "name")
+            flags["cue_point_set_name"] = getattr(prop, "fset", None) is not None
+        except Exception:
+            flags["cue_point_set_name"] = False
         return flags
 
     def _dump_live_api(self, module=None):
@@ -1608,9 +1615,16 @@ class AbletonMCP(ControlSurface):
             raise
 
     def _set_current_song_time(self, time_val):
-        """Move the arrangement playhead to a position in beats"""
+        """Move the arrangement playhead to a position in beats.
+
+        A generator: Live moves the playhead on its next tick, so wait for it
+        before reading the position back.
+        """
         try:
-            self._song.current_song_time = float(time_val)
+            target = float(time_val)
+            self._song.current_song_time = target
+            yield from self._wait_for(
+                lambda: self._playhead_at(target), max_ticks=5, raise_on_timeout=False)
             return {"current_song_time": self._song.current_song_time}
         except Exception as e:
             self.log_message("Error setting current song time: " + str(e))
@@ -1780,22 +1794,35 @@ class AbletonMCP(ControlSurface):
                             "Failed to create cue at time %s (Live did not add one "
                             "at the playhead)" % target_time, "internal_error")
                 except Exception:
-                    song.current_song_time = original_time
+                    self._put_playhead_back(original_time)
                     raise
-                yield from self._restore_playhead(original_time)
+                restored = yield from self._restore_playhead(original_time)
                 existing = self._cue_at(target_time)
+            else:
+                restored = None
 
-            if name:
+            # CuePoint.name is read-only on Live 11 (live_api.cue_point_set_name),
+            # so a rename can fail; the locator exists either way.
+            requested = str(name) if name else None
+            if requested is not None and str(existing.name) != requested:
                 try:
-                    existing.name = str(name)
+                    existing.name = requested
                 except Exception as e:
                     self.log_message("Could not rename locator: " + str(e))
+                else:
+                    yield
+                    existing = self._cue_at(target_time) or existing
 
-            return {
+            result = {
                 "success": True,
                 "time": existing.time,
                 "name": existing.name,
+                "requested_name": requested,
+                "name_applied": requested is None or str(existing.name) == requested,
             }
+            if restored is not None:
+                result["playhead_restored"] = restored
+            return result
         except Exception as e:
             self.log_message("Error creating locator: " + str(e))
             raise
@@ -1816,14 +1843,43 @@ class AbletonMCP(ControlSurface):
                 "Could not move the playhead to %s (it is at %s)"
                 % (time_val, self._song.current_song_time), "timeout")
 
+    def _clamp_playhead(self, time_val):
+        """Live refuses a playhead behind song_length, which can shrink while
+        a command runs (moving the playhead can shorten the song)."""
+        time_val = max(0.0, float(time_val))
+        try:
+            return min(time_val, float(self._song.song_length))
+        except Exception:
+            return time_val
+
+    def _put_playhead_back(self, time_val):
+        """Best-effort, same-tick restore for error paths; never raises."""
+        try:
+            self._song.current_song_time = self._clamp_playhead(time_val)
+            return True
+        except Exception as e:
+            self.log_message("playhead: could not restore to %s: %s" % (time_val, e))
+            return False
+
     def _restore_playhead(self, time_val):
-        """Generator: put the playhead back; best effort, never raises."""
-        self._song.current_song_time = time_val
-        restored = yield from self._wait_for(
-            lambda: self._playhead_at(time_val), raise_on_timeout=False)
-        if not restored:
-            self.log_message("playhead: could not restore to %s (at %s)"
-                             % (time_val, self._song.current_song_time))
+        """Generator: put the playhead back after a successful edit.
+
+        Never raises: the edit already happened, so a failed restore is only
+        logged. Returns True when the playhead is back at time_val (False
+        when it had to be clamped to the song length or did not move).
+        """
+        target = self._clamp_playhead(time_val)
+        try:
+            self._song.current_song_time = target
+        except Exception as e:
+            self.log_message("playhead: could not restore to %s: %s" % (target, e))
+            return False
+        landed = yield from self._wait_for(
+            lambda: self._playhead_at(target), raise_on_timeout=False)
+        if not landed or target != float(time_val):
+            self.log_message("playhead: restore to %s ended at %s (clamped to %s)"
+                             % (time_val, self._song.current_song_time, target))
+        return landed and abs(target - float(time_val)) <= self._TIME_TOLERANCE
 
     # ── Arrangement ─────────────────────────────────────────────────────────
 
@@ -1935,7 +1991,8 @@ class AbletonMCP(ControlSurface):
                     lambda: self._playhead_at(info["time"]), max_ticks=3,
                     raise_on_timeout=False)
             else:
-                yield from self._in_undo_step(lambda: self._delete_cue(info["time"]))
+                restored = yield from self._in_undo_step(
+                    lambda: self._delete_cue(info["time"]))
         elif action in ("next", "previous"):
             if action == "next":
                 song.jump_to_next_cue()
@@ -1950,11 +2007,14 @@ class AbletonMCP(ControlSurface):
             raise CommandError(
                 "Unknown cue_point action: %s (use jump, next, previous or delete)"
                 % (action,), "invalid_value")
-        return {
+        result = {
             "action": action,
             "cue": info,
             "current_song_time": float(song.current_song_time),
         }
+        if action == "delete":
+            result["playhead_restored"] = restored
+        return result
 
     def _delete_cue(self, cue_time):
         """Generator: delete the cue at cue_time.
@@ -1983,9 +2043,10 @@ class AbletonMCP(ControlSurface):
                 raise CommandError(
                     "Live did not delete the cue at %s" % cue_time, "timeout")
         except Exception:
-            song.current_song_time = original_time
+            self._put_playhead_back(original_time)
             raise
-        yield from self._restore_playhead(original_time)
+        restored = yield from self._restore_playhead(original_time)
+        return restored
 
     def _set_arrangement_loop(self, enabled=None, start=None, length=None):
         """Set the arrangement loop switch and/or its start and length (beats)."""
@@ -2113,7 +2174,7 @@ class AbletonMCP(ControlSurface):
             # duplicate_clip_to_arrangement moves the playhead to the new clip
             # (on the next tick); put it back where the user left it.
             yield
-            yield from self._restore_playhead(original_time)
+            restored = yield from self._restore_playhead(original_time)
             return {
                 "track_index": track_index,
                 "clip_index": index,
@@ -2122,15 +2183,20 @@ class AbletonMCP(ControlSurface):
                 "end_time": float(clip.end_time),
                 "note_count": len(notes),
                 "method": method,
+                "playhead_restored": restored,
             }
         except Exception as e:
             self.log_message("Error creating arrangement MIDI clip: " + str(e))
             if original_time is not None:
-                self._song.current_song_time = original_time
+                self._put_playhead_back(original_time)
             raise
 
     def _create_arrangement_audio_clip(self, track_index, path, start, allow_overlap=False):
-        """Import an audio file into the arrangement with Track.create_audio_clip."""
+        """Import an audio file into the arrangement with Track.create_audio_clip.
+
+        Live moves the playhead to the new clip; it is put back afterwards.
+        """
+        original_time = None
         try:
             if not path:
                 raise CommandError("Audio file path is required", "invalid_audio_file")
@@ -2156,8 +2222,11 @@ class AbletonMCP(ControlSurface):
                 self._check_arrangement_overlap(track, start)
 
             before = self._arrangement_clips(track)
+            original_time = self._song.current_song_time
             track.create_audio_clip(path, start)
             index, clip = self._find_new_arrangement_clip(track, before, start)
+            yield
+            restored = yield from self._restore_playhead(original_time)
             return {
                 "track_index": track_index,
                 "clip_index": index,
@@ -2165,9 +2234,12 @@ class AbletonMCP(ControlSurface):
                 "start_time": float(clip.start_time),
                 "end_time": float(clip.end_time),
                 "length": float(clip.length),
+                "playhead_restored": restored,
             }
         except Exception as e:
             self.log_message("Error creating arrangement audio clip: " + str(e))
+            if original_time is not None:
+                self._put_playhead_back(original_time)
             raise
 
     # key -> cast, in the order they are applied. warping comes before the

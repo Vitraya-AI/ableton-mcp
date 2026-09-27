@@ -250,6 +250,8 @@ class AudioTrack(FakeTrack):
     def create_audio_clip(self, path, time):
         self.imports.append((path, time))
         self.add_arrangement_clip(FakeClip("sample", 8.0, time, is_midi_clip=False))
+        # Live moves the playhead to the imported clip.
+        self.song.current_song_time = time
 
 
 class GroupTrack(FakeTrack):
@@ -266,6 +268,19 @@ class FakeCue(object):
 
     def jump(self):
         self.song.current_song_time = self.time
+
+
+class ReadOnlyNameCue(FakeCue):
+    """Live 11: CuePoint.name is Get/Listen only."""
+
+    def __init__(self, song, name, time):
+        self.song = song
+        self._name = name
+        self.time = time
+
+    @property
+    def name(self):
+        return self._name
 
 
 class FakeSong(object):
@@ -291,9 +306,14 @@ class FakeSong(object):
         self.cue_select_fails = False
         self.playhead_stuck = False
         self.toggle_ignored = False
+        self.cue_class = FakeCue
+        # When set, applying a playhead move shortens the song to this length.
+        self.shrink_on_move = None
         self.settle()
 
     def __setattr__(self, key, value):
+        if key == "current_song_time" and value > getattr(self, "song_length", value):
+            raise RuntimeError("Cannot set the Songtime behind the Songlength")
         if key in self.PENDING:
             if not (key == "current_song_time" and getattr(self, "playhead_stuck", False)):
                 self._pending[key] = value
@@ -302,9 +322,12 @@ class FakeSong(object):
 
     def settle(self):
         """Apply pending writes, as Live does on its next tick."""
+        moved = "current_song_time" in self._pending
         for key, value in self._pending.items():
             object.__setattr__(self, key, value)
         self._pending.clear()
+        if moved and getattr(self, "shrink_on_move", None) is not None:
+            self.song_length = self.shrink_on_move
         for track in self.tracks:
             clips = [slot.clip for slot in track.clip_slots if slot.clip is not None]
             clips.extend(track._arrangement)
@@ -324,7 +347,7 @@ class FakeSong(object):
         self.events.append("end")
 
     def add_cue(self, name, time):
-        self.cue_points.append(FakeCue(self, name, time))
+        self.cue_points.append(self.cue_class(self, name, time))
 
     # Cue operations use the applied playhead, not a pending write.
     def _cue_here(self):
@@ -573,7 +596,7 @@ def test_midi_clip_live11_session_fallback(script):
                     track_index=0, start=8.0, length=4.0, notes=NOTES, name="Hook"))
     assert result == {"track_index": 0, "clip_index": 1, "name": "Hook",
                       "start_time": 8.0, "end_time": 12.0, "note_count": 2,
-                      "method": "session_fallback"}
+                      "method": "session_fallback", "playhead_restored": True}
     new = track.arrangement_clips[1]
     assert [(n.pitch, n.start_time) for n in new.notes] == [(60, 0.0), (64, 1.0)]
     # The temporary Session clip is gone; the occupied slot is untouched.
@@ -699,7 +722,8 @@ def test_audio_clip(script, wav):
                     track_index=0, path=wav, start=16.0))
     assert track.imports == [(wav, 16.0)]
     assert result == {"track_index": 0, "clip_index": 1, "name": "sample",
-                      "start_time": 16.0, "end_time": 24.0, "length": 8.0}
+                      "start_time": 16.0, "end_time": 24.0, "length": 8.0,
+                      "playhead_restored": True}
     assert song.undo_steps == ["begin", "end"]
 
 
@@ -947,7 +971,9 @@ def test_create_locator_toggles_at_the_target_not_the_old_playhead(script):
     song.current_song_time = 32.0
     song.settle()
     result = ok(run(make_instance(script, song), "create_locator", name="Intro", time=0.0))
-    assert result == {"success": True, "time": 0.0, "name": "Intro"}
+    assert result == {"success": True, "time": 0.0, "name": "Intro",
+                      "requested_name": "Intro", "name_applied": True,
+                      "playhead_restored": True}
     assert [(c.name, c.time) for c in song.cue_points] == [("Intro", 0.0)]
     assert song.current_song_time == 32.0
     assert song.events.count("toggle") == 1
@@ -989,10 +1015,12 @@ def test_create_locator_never_toggles_when_the_playhead_does_not_move(script):
 
 def test_cue_delete_removes_only_the_target_and_spans_one_undo_step(script):
     song = _cue_song()
+    song.song_length = 500.0
     song.add_cue("Outro", 462.0)
     song.current_song_time = 462.0
     song.settle()
     result = ok(run(make_instance(script, song), "cue_point", action="delete", name="Intro"))
+    assert result["playhead_restored"] is True
     assert result["cue"] == {"name": "Intro", "time": 0.0}
     assert sorted(c.time for c in song.cue_points) == [8.0, 24.0, 462.0]
     assert song.events.count("toggle") == 1
@@ -1012,6 +1040,7 @@ def test_cue_delete_never_toggles_when_the_playhead_does_not_move(script):
 
 def test_cue_next_reports_where_live_landed(script):
     song = _cue_song()
+    song.song_length = 500.0
     song.add_cue("Outro", 462.0)
     song.current_song_time = 32.0
     song.settle()
@@ -1105,3 +1134,101 @@ def test_plain_commands_run_in_one_tick(script):
     song = _arrangement_song()
     ok(run(make_instance(script, song), "delete_clip", track_index=0, clip_index=0))
     assert song.events == ["begin", "end"]
+
+
+# --------------------------------------------------------------------------
+# Locator names, playhead restore limits, set_current_song_time
+# --------------------------------------------------------------------------
+
+def test_create_locator_reports_a_rename_live_11_refuses(script):
+    song = FakeSong()
+    song.cue_class = ReadOnlyNameCue
+    response = run(make_instance(script, song), "create_locator", name="Verse", time=16.0)
+    result = ok(response)
+    assert result["time"] == 16.0
+    assert result["name"] == ""
+    assert result["requested_name"] == "Verse"
+    assert result["name_applied"] is False
+    assert len(song.cue_points) == 1
+
+
+def test_create_locator_rename_of_existing_cue_on_live_11(script):
+    song = FakeSong()
+    song.cue_class = ReadOnlyNameCue
+    song.add_cue("1", 8.0)
+    result = ok(run(make_instance(script, song), "create_locator", name="Drop", time=8.0))
+    assert (result["name"], result["name_applied"]) == ("1", False)
+    assert "playhead_restored" not in result
+    assert "toggle" not in song.events
+
+
+def test_create_locator_without_name_counts_as_applied(script):
+    song = FakeSong()
+    song.cue_class = ReadOnlyNameCue
+    result = ok(run(make_instance(script, song), "create_locator", name="", time=4.0))
+    assert result["requested_name"] is None
+    assert result["name_applied"] is True
+
+
+def test_create_locator_name_applied_when_names_are_writable(script):
+    song = FakeSong()
+    song.add_cue("1", 8.0)
+    result = ok(run(make_instance(script, song), "create_locator", name="Drop", time=8.0))
+    assert (result["name"], result["name_applied"]) == ("Drop", True)
+
+
+def test_midi_clip_succeeds_when_the_song_shrinks_below_the_old_playhead(script):
+    song = FakeSong([FakeTrack("Keys")])
+    song.song_length = 280.0
+    song.current_song_time = 248.0
+    song.settle()
+    song.shrink_on_move = 232.0
+    result = ok(run(make_instance(script, song), "create_arrangement_midi_clip",
+                    track_index=0, start=16.0, length=4.0))
+    assert result["clip_index"] == 0
+    assert result["playhead_restored"] is False
+    assert song.current_song_time == 232.0
+    assert song.undo_steps == ["begin", "end"]
+
+
+def test_create_locator_succeeds_when_the_song_shrinks(script):
+    song = FakeSong()
+    song.song_length = 280.0
+    song.current_song_time = 248.0
+    song.settle()
+    song.shrink_on_move = 232.0
+    result = ok(run(make_instance(script, song), "create_locator", name="A", time=16.0))
+    assert result["playhead_restored"] is False
+    assert [c.time for c in song.cue_points] == [16.0]
+
+
+def test_cue_delete_succeeds_when_the_song_shrinks(script):
+    song = _cue_song()
+    song.song_length = 280.0
+    song.current_song_time = 248.0
+    song.settle()
+    song.shrink_on_move = 232.0
+    result = ok(run(make_instance(script, song), "cue_point", action="delete", name="Intro"))
+    assert result["playhead_restored"] is False
+    assert sorted(c.time for c in song.cue_points) == [8.0, 24.0]
+
+
+def test_audio_clip_restores_the_playhead(script, wav):
+    track = AudioTrack()
+    song = FakeSong([track])
+    song.current_song_time = 40.0
+    song.settle()
+    result = ok(run(make_instance(script, song), "create_arrangement_audio_clip",
+                    track_index=0, path=wav, start=32.0))
+    assert result["playhead_restored"] is True
+    assert song.current_song_time == 40.0
+    _one_undo_step_around_ticks(song)
+
+
+def test_set_current_song_time_reads_back_after_the_tick(script):
+    song = FakeSong()
+    song.current_song_time = 16.0
+    song.settle()
+    result = ok(run(make_instance(script, song), "set_current_song_time", time=40.0))
+    assert result == {"current_song_time": 40.0}
+    assert song.undo_steps == []
