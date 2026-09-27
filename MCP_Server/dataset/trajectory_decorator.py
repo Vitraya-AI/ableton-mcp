@@ -57,6 +57,11 @@ MODIFYING_TOOLS = {
     "fire_scene",
     "delete_scene",
     "set_scene_name",
+    "cue_point",
+    "set_arrangement_loop",
+    "create_arrangement_midi_clip",
+    "create_arrangement_audio_clip",
+    "set_clip_properties",
 }
 
 _PARAM_KEYS = (
@@ -99,6 +104,14 @@ _PARAM_KEYS = (
     "time_span",
     "from_pitch",
     "pitch_span",
+    "start",
+    "start_bar",
+    "length_bars",
+    "view",
+    "action",
+    "allow_overlap",
+    "enabled",
+    "bar",
 )
 
 # A `path` ending in one of these is a file on disk, not a Live browser category.

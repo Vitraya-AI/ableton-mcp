@@ -1,6 +1,6 @@
 # Extended Features Port — Plan
 
-Status: **Phase 0 done and verified in Live 11.3.43 (Remote Script 1.9.1); next is Phase 1** (written 2026-09-26). Work happens on the
+Status: **Phases 0–1 done (Remote Script 1.10.0); Phase 1 awaiting Live checks; next is Phase 2** (written 2026-09-26). Work happens on the
 `extended-features` branch. This document is the hand-off: a new session should
 be able to start Phase 0 from here without the conversation that produced it.
 
@@ -102,7 +102,16 @@ use the `ableton-mcp-dump-live-api` command.
    (fetched once per call from `get_session_info`). Beats per bar =
    `numerator * 4 / denominator`. Bar 1 = beat 0. Reject bar < 1.
 
-## Phase 1 — Arrangement (Remote Script 1.10.0)
+## Phase 1 — Arrangement ✅ implemented (Remote Script 1.10.0)
+
+Implemented to the table below, including `create_arrangement_audio_clip`
+(approved). Choices made where the spec was silent: `cue_point` with both
+name and time uses the name; `no_free_clip_slot` instead of a temporary scene
+on Live 11; the temporary Session clip is always removed in a `finally`;
+Session `delete_clip` keeps returning `{"deleted": false}` for an empty slot;
+`set_clip_properties` sets `warping` before markers (it changes their unit).
+Tool list: 56 tools, ~10.9k tokens (up from ~8.3k).
+**Still to do in Live:** the "Arrangement (1.10.0)" smoke checks.
 
 Existing arrangement tools in the fork, keep as they are: `create_locator`,
 `duplicate_to_arrangement`, `get_arrangement_clips`, `set_arrangement_time`,
@@ -118,7 +127,7 @@ time), matching `get_arrangement_clips`.
 | `create_arrangement_midi_clip(track_index, start, length, notes=None, name=None)` (new; `start_bar`/`length_bars` alternatives) | Live 12: `track.create_midi_clip`. **Live 11 fallback:** find an empty Session slot on that track (error `no_free_clip_slot` if none, or create a scene and remove it afterwards), `create_clip(length)`, add notes, `track.duplicate_clip_to_arrangement(clip, start)`, delete the temporary Session clip — all inside one undo step. Refuse overlapping an existing arrangement clip unless `allow_overlap=True` (extended's `_check_overlap` idea). Returns the new clip's arrangement index. MIDI tracks only. |
 | Note tools gain `view="session" \| "arrangement"` | `get_clip_notes`, `add_notes_to_clip`, `modify_clip_notes`, `remove_notes_from_clip`, `clear_notes_from_clip`. With `view="arrangement"`, `clip_index` indexes `track.arrangement_clips`. One shared resolver in the Remote Script (`_resolve_clip(track_index, clip_index, view)`). Default stays `session`, so existing callers are unaffected. |
 | `delete_clip` gains `view` | Arrangement deletion uses `track.delete_clip(clip)`. |
-| *(proposed, awaiting user OK)* `create_arrangement_audio_clip(track_index, path, start / start_bar)` | `Track.create_audio_clip` exists on 11.3.43, so arrangement audio clips are possible. Was out of scope only because it looked Live-12-only. Returns the new clip's arrangement index (Live returns None, so find it by start time). |
+| `create_arrangement_audio_clip(track_index, path, start / start_bar)` | `Track.create_audio_clip` exists on 11.3.43, so arrangement audio clips are possible. Was out of scope only because it looked Live-12-only. Returns the new clip's arrangement index (Live returns None, so find it by start time). |
 | `set_clip_properties(track_index, clip_index, properties, view="session")` (new) | Sets several properties in one call from an allowlist: `name`, `muted`, `color`, `looping`, `loop_start`, `loop_end`, `start_marker`, `end_marker`, `gain`, `pitch_coarse`, `pitch_fine`, `warping`, `warp_mode`. Audio-only keys (`gain`, `pitch_*`, `warp*`) error with a clear code on MIDI clips. Unknown keys → `invalid_value` listing the allowed ones. Returns the values read back. |
 
 ## Phase 2 — Devices and racks (Remote Script 1.11.0)

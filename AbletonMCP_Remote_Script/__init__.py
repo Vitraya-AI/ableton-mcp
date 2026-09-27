@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.9.1"
+SCRIPT_VERSION = "1.10.0"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -77,6 +77,16 @@ SCRIPT_CAPABILITIES = [
     "delete_scene",
     "set_scene_name",
     "dump_live_api",
+    "get_arrangement_info",
+    "cue_point",
+    "set_arrangement_loop",
+    "create_arrangement_midi_clip",
+    "create_arrangement_audio_clip",
+    "set_clip_properties",
+    # Flag, not a command: the note tools and delete_clip understand
+    # view="arrangement". Older scripts would ignore it and act on a Session
+    # clip, so the server refuses the view without this.
+    "clip_view_param",
     "error_codes",
 ]
 
@@ -333,7 +343,10 @@ class AbletonMCP(ControlSurface):
     
     # create_audio_clip decodes/imports the file on the main thread and needs
     # more than the default headroom.
-    _MAIN_THREAD_TIMEOUTS = {"create_audio_clip": 60.0}
+    _MAIN_THREAD_TIMEOUTS = {
+        "create_audio_clip": 60.0,
+        "create_arrangement_audio_clip": 60.0,
+    }
 
     # Commands that edit the set. Each runs as its own undo step: without the
     # boundary Live can merge back-to-back script edits, so creating then
@@ -351,6 +364,8 @@ class AbletonMCP(ControlSurface):
         "set_device_parameter", "create_scene", "delete_scene", "set_scene_name",
         "load_instrument_or_effect", "load_browser_item",
         "duplicate_session_clip_to_arrangement", "create_locator", "map_rack_magnitude",
+        "set_arrangement_loop", "create_arrangement_midi_clip",
+        "create_arrangement_audio_clip", "set_clip_properties",
     ])
 
     def _read_handlers(self, params):
@@ -365,7 +380,9 @@ class AbletonMCP(ControlSurface):
                 p("category_type", "all"), p("max_depth", 1)),
             "get_browser_items_at_path": lambda: self.get_browser_items_at_path(p("path", "")),
             "get_arrangement_clips": lambda: self._get_arrangement_clips(p("track_index", 0)),
-            "get_clip_notes": lambda: self._get_clip_notes(p("track_index", 0), p("clip_index", 0)),
+            "get_clip_notes": lambda: self._get_clip_notes(
+                p("track_index", 0), p("clip_index", 0), p("view", None)),
+            "get_arrangement_info": lambda: self._get_arrangement_info(),
             "get_device_parameters": lambda: self._get_device_parameters(
                 p("track_index", 0), p("device_index", 0)),
             "get_session_snapshot": lambda: self._get_session_snapshot(
@@ -388,22 +405,23 @@ class AbletonMCP(ControlSurface):
             "create_audio_clip": lambda: self._create_audio_clip(
                 p("track_index", 0), p("clip_index", 0), p("path", "")),
             "add_notes_to_clip": lambda: self._add_notes_to_clip(
-                p("track_index", 0), p("clip_index", 0), p("notes", [])),
+                p("track_index", 0), p("clip_index", 0), p("notes", []), p("view", None)),
             "modify_clip_notes": lambda: self._modify_clip_notes(
-                p("track_index", 0), p("clip_index", 0), p("notes", [])),
+                p("track_index", 0), p("clip_index", 0), p("notes", []), p("view", None)),
             "remove_notes_from_clip": lambda: self._remove_notes_from_clip(
                 p("track_index", 0), p("clip_index", 0),
                 p("from_time", 0.0), p("time_span", -1.0),
-                p("from_pitch", 0), p("pitch_span", 128)),
+                p("from_pitch", 0), p("pitch_span", 128), p("view", None)),
             "clear_notes_from_clip": lambda: self._clear_notes_from_clip(
-                p("track_index", 0), p("clip_index", 0)),
+                p("track_index", 0), p("clip_index", 0), p("view", None)),
             "set_clip_name": lambda: self._set_clip_name(
                 p("track_index", 0), p("clip_index", 0), p("name", "")),
             "set_arrangement_clip_name": lambda: self._set_arrangement_clip_name(
                 p("track_index", 0), p("clip_index", 0), p("name", "")),
             "duplicate_clip": lambda: self._duplicate_clip(
                 p("track_index", 0), p("source_clip_index", 0), p("dest_clip_index", 0)),
-            "delete_clip": lambda: self._delete_clip(p("track_index", 0), p("clip_index", 0)),
+            "delete_clip": lambda: self._delete_clip(
+                p("track_index", 0), p("clip_index", 0), p("view", None)),
             "fire_clip": lambda: self._fire_clip(p("track_index", 0), p("clip_index", 0)),
             "stop_clip": lambda: self._stop_clip(p("track_index", 0), p("clip_index", 0)),
             "set_tempo": lambda: self._set_tempo(p("tempo", 120.0)),
@@ -439,6 +457,16 @@ class AbletonMCP(ControlSurface):
             "duplicate_session_clip_to_arrangement": lambda: self._duplicate_session_clip_to_arrangement(
                 p("track_index", 0), p("clip_index", 0), p("destination_time", 0.0)),
             "create_locator": lambda: self._create_locator(p("name", ""), p("time", 0.0)),
+            "cue_point": lambda: self._cue_point(p("action", None), p("name", None), p("time", None)),
+            "set_arrangement_loop": lambda: self._set_arrangement_loop(
+                p("enabled", None), p("start", None), p("length", None)),
+            "create_arrangement_midi_clip": lambda: self._create_arrangement_midi_clip(
+                p("track_index", 0), p("start", 0.0), p("length", 4.0), p("notes", None),
+                p("name", None), p("allow_overlap", False)),
+            "create_arrangement_audio_clip": lambda: self._create_arrangement_audio_clip(
+                p("track_index", 0), p("path", ""), p("start", 0.0), p("allow_overlap", False)),
+            "set_clip_properties": lambda: self._set_clip_properties(
+                p("track_index", 0), p("clip_index", 0), p("view", None), p("properties", None)),
             # Racks
             "map_rack_magnitude": lambda: self._map_rack_magnitude(
                 p("track_index", 0), p("device_index", 0), p("macro_name", "Magnitude")),
@@ -949,38 +977,11 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error creating audio clip: " + str(e))
             raise
 
-    def _add_notes_to_clip(self, track_index, clip_index, notes):
+    def _add_notes_to_clip(self, track_index, clip_index, notes, view=None):
         """Add MIDI notes to a clip"""
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            
-            track = self._song.tracks[track_index]
-            
-            if clip_index < 0 or clip_index >= len(track.clip_slots):
-                raise IndexError("Clip index out of range")
-            
-            clip_slot = track.clip_slots[clip_index]
-            
-            if not clip_slot.has_clip:
-                raise Exception("No clip in slot")
-            
-            clip = clip_slot.clip
-
-            # Both paths append; neither replaces existing notes.
-            note_ids = self._add_new_notes(clip, notes)
-            if note_ids is None:
-                live_notes = []
-                for note in notes:
-                    pitch = note.get("pitch", 60)
-                    start_time = note.get("start_time", 0.0)
-                    duration = note.get("duration", 0.25)
-                    velocity = note.get("velocity", 100)
-                    mute = note.get("mute", False)
-
-                    live_notes.append((pitch, start_time, duration, velocity, mute))
-
-                clip.set_notes(tuple(live_notes))
+            clip = self._resolve_clip(track_index, clip_index, view)
+            note_ids = self._add_notes(clip, notes)
 
             result = {
                 "note_count": len(notes)
@@ -991,6 +992,26 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error adding notes to clip: " + str(e))
             raise
+
+    def _add_notes(self, clip, notes):
+        """Append notes to clip; returns their IDs, or None on the legacy API.
+
+        Both paths append; neither replaces existing notes.
+        """
+        note_ids = self._add_new_notes(clip, notes)
+        if note_ids is None:
+            live_notes = []
+            for note in notes:
+                pitch = note.get("pitch", 60)
+                start_time = note.get("start_time", 0.0)
+                duration = note.get("duration", 0.25)
+                velocity = note.get("velocity", 100)
+                mute = note.get("mute", False)
+
+                live_notes.append((pitch, start_time, duration, velocity, mute))
+
+            clip.set_notes(tuple(live_notes))
+        return note_ids
 
     _EXTENDED_NOTE_FIELDS = ("probability", "velocity_deviation", "release_velocity")
 
@@ -1144,9 +1165,17 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error stopping clip: " + str(e))
             raise
 
-    def _delete_clip(self, track_index, clip_index):
-        """Delete the clip in the given clip slot, freeing the slot for reuse."""
+    def _delete_clip(self, track_index, clip_index, view=None):
+        """Delete the clip in the given clip slot, freeing the slot for reuse.
+
+        With view="arrangement", delete the track's clip_index-th arrangement clip.
+        """
         try:
+            if self._check_view(view) == "arrangement":
+                clip = self._resolve_clip(track_index, clip_index, view)
+                self._song.tracks[track_index].delete_clip(clip)
+                return {"deleted": True}
+
             if track_index < 0 or track_index >= len(self._song.tracks):
                 raise IndexError("Track index out of range")
 
@@ -1181,14 +1210,46 @@ class AbletonMCP(ControlSurface):
             raise CommandError("Clip index out of range", "clip_index_out_of_range")
         return track.clip_slots[clip_index]
 
-    def _get_midi_clip(self, track_index, clip_index):
-        slot = self._get_clip_slot(track_index, clip_index)
-        if not slot.has_clip:
-            raise CommandError("No clip in slot", "clip_slot_empty")
-        clip = slot.clip
+    def _get_midi_clip(self, track_index, clip_index, view=None):
+        clip = self._resolve_clip(track_index, clip_index, view)
         if not getattr(clip, "is_midi_clip", False):
             raise CommandError("Clip is not a MIDI clip", "not_midi_clip")
         return clip
+
+    def _check_view(self, view):
+        """Normalise the view parameter: absent means "session"."""
+        if view is None or view == "session":
+            return "session"
+        if view == "arrangement":
+            return "arrangement"
+        raise CommandError(
+            "view must be 'session' or 'arrangement' (got: %s)" % (view,), "invalid_value")
+
+    def _arrangement_clips(self, track):
+        """list(track.arrangement_clips), or [] where the track has none
+        (group, return and master tracks)."""
+        try:
+            return list(track.arrangement_clips)
+        except Exception:
+            return []
+
+    def _resolve_clip(self, track_index, clip_index, view=None):
+        """The clip a command addresses.
+
+        Session: clip_index is the clip slot. Arrangement: clip_index indexes
+        list(track.arrangement_clips), which Live orders by start time.
+        """
+        if self._check_view(view) == "arrangement":
+            clips = self._arrangement_clips(self._get_track(track_index))
+            if clip_index < 0 or clip_index >= len(clips):
+                raise CommandError(
+                    "Clip index out of range (track has %d arrangement clips)" % len(clips),
+                    "clip_index_out_of_range")
+            return clips[clip_index]
+        slot = self._get_clip_slot(track_index, clip_index)
+        if not slot.has_clip:
+            raise CommandError("No clip in slot", "clip_slot_empty")
+        return slot.clip
 
     def _get_scene(self, scene_index):
         if scene_index < 0 or scene_index >= len(self._song.scenes):
@@ -1204,7 +1265,7 @@ class AbletonMCP(ControlSurface):
 
     # ── Note editing (Live 11 note-ID API) ──────────────────────────────────
 
-    def _modify_clip_notes(self, track_index, clip_index, notes):
+    def _modify_clip_notes(self, track_index, clip_index, notes, view=None):
         """Edit existing notes in place, matched by note_id.
 
         apply_note_modifications only accepts the MidiNoteVector Live handed
@@ -1212,7 +1273,7 @@ class AbletonMCP(ControlSurface):
         mutate the matching notes in place and pass the same vector back.
         """
         try:
-            clip = self._get_midi_clip(track_index, clip_index)
+            clip = self._get_midi_clip(track_index, clip_index, view)
 
             changes_by_id = {}
             for note in notes:
@@ -1249,13 +1310,13 @@ class AbletonMCP(ControlSurface):
 
     def _remove_notes_from_clip(self, track_index, clip_index,
                                 from_time=0.0, time_span=-1.0,
-                                from_pitch=0, pitch_span=128):
+                                from_pitch=0, pitch_span=128, view=None):
         """Remove the notes inside a pitch/time window.
 
         A negative time_span means "to the end of the clip".
         """
         try:
-            clip = self._get_midi_clip(track_index, clip_index)
+            clip = self._get_midi_clip(track_index, clip_index, view)
             from_time = float(from_time)
             if time_span is None or time_span < 0:
                 time_span = max(float(clip.length) - from_time, 0.0)
@@ -1519,28 +1580,15 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting arrangement clips: " + str(e))
             raise
 
-    def _clear_notes_from_clip(self, track_index, clip_index):
-        """Remove all MIDI notes from a Session clip.
+    def _clear_notes_from_clip(self, track_index, clip_index, view=None):
+        """Remove all MIDI notes from a Session (or arrangement) clip.
 
         Pairs with _add_notes_to_clip to make a real replace (clear, then add),
         which the write-only API otherwise can't do. Counts notes first so the
         result can report how many were removed.
         """
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-
-            track = self._song.tracks[track_index]
-
-            if clip_index < 0 or clip_index >= len(track.clip_slots):
-                raise IndexError("Clip index out of range")
-
-            clip_slot = track.clip_slots[clip_index]
-
-            if not clip_slot.has_clip:
-                raise Exception("No clip in slot")
-
-            clip = clip_slot.clip
+            clip = self._resolve_clip(track_index, clip_index, view)
 
             if not clip.is_midi_clip:
                 raise Exception("Clip is not a MIDI clip; no notes to clear")
@@ -1673,6 +1721,383 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error creating locator: " + str(e))
+            raise
+
+    # ── Arrangement ─────────────────────────────────────────────────────────
+
+    # Tolerance, in beats, for matching a cue or a new clip by its time.
+    _TIME_TOLERANCE = 1e-3
+    # Arrangement positions Track.create_audio_clip accepts, in beats.
+    _MAX_ARRANGEMENT_TIME = 1576800.0
+
+    def _get_arrangement_info(self):
+        """One-call overview of the arrangement timeline."""
+        song = self._song
+        tracks = []
+        for t_index, track in enumerate(song.tracks):
+            clips = []
+            for c_index, clip in enumerate(self._arrangement_clips(track)):
+                clips.append({
+                    "index": c_index,
+                    "name": str(clip.name),
+                    "start_time": float(clip.start_time),
+                    "end_time": float(clip.end_time),
+                    "length": float(clip.length),
+                    "is_midi_clip": bool(getattr(clip, "is_midi_clip", False)),
+                    "muted": bool(getattr(clip, "muted", False)),
+                })
+            tracks.append({
+                "index": t_index,
+                "name": str(track.name),
+                "is_midi_track": bool(getattr(track, "has_midi_input", False)),
+                "is_audio_track": bool(getattr(track, "has_audio_input", False)),
+                "is_group_track": bool(getattr(track, "is_foldable", False)),
+                "clips": clips,
+            })
+        return {
+            "song_length": float(song.song_length),
+            "current_song_time": float(song.current_song_time),
+            "loop": {
+                "enabled": bool(song.loop),
+                "start": float(song.loop_start),
+                "length": float(song.loop_length),
+            },
+            "tempo": float(song.tempo),
+            "signature_numerator": int(song.signature_numerator),
+            "signature_denominator": int(song.signature_denominator),
+            "cue_points": [
+                {"index": i, "name": str(cue.name), "time": float(cue.time)}
+                for i, cue in enumerate(self._sorted_cues())
+            ],
+            "tracks": tracks,
+        }
+
+    def _sorted_cues(self):
+        return sorted(self._song.cue_points, key=lambda cue: float(cue.time))
+
+    def _find_cue(self, name, time_val, exact_time):
+        """Cue by name (case-insensitive, first in time order) or by time.
+
+        exact_time: the cue must sit within _TIME_TOLERANCE of time_val;
+        otherwise the nearest cue is taken. A name takes precedence over a time.
+        """
+        cues = self._sorted_cues()
+        if name is not None:
+            wanted = str(name).lower()
+            for cue in cues:
+                if str(cue.name).lower() == wanted:
+                    return cue
+            raise CommandError("No cue point named '%s'" % name, "cue_not_found")
+        target = float(time_val)
+        best = None
+        for cue in cues:
+            distance = abs(float(cue.time) - target)
+            if best is None or distance < best[0]:
+                best = (distance, cue)
+        if best is None or (exact_time and best[0] > self._TIME_TOLERANCE):
+            raise CommandError("No cue point at time %s" % target, "cue_not_found")
+        return best[1]
+
+    def _cue_at(self, time_val):
+        for cue in self._song.cue_points:
+            if abs(float(cue.time) - float(time_val)) <= self._TIME_TOLERANCE:
+                return cue
+        return None
+
+    @staticmethod
+    def _cue_dict(cue):
+        if cue is None:
+            return None
+        return {"name": str(cue.name), "time": float(cue.time)}
+
+    def _cue_point(self, action, name=None, time_val=None):
+        """Jump to, step through or delete arrangement cue points (locators).
+
+        Not an undoable command: jumps must not push undo steps. Only the
+        delete runs inside one.
+        """
+        song = self._song
+        if action in ("jump", "delete"):
+            if name is None and time_val is None:
+                raise CommandError(
+                    "cue_point %s needs a name or a time" % action, "invalid_value")
+            cue = self._find_cue(name, time_val, exact_time=(action == "delete"))
+            info = self._cue_dict(cue)
+            if action == "jump":
+                cue.jump()
+            else:
+                self._in_undo_step(lambda: self._delete_cue(info["time"]))
+        elif action == "next":
+            song.jump_to_next_cue()
+            info = self._cue_dict(self._cue_at(song.current_song_time))
+        elif action == "previous":
+            song.jump_to_prev_cue()
+            info = self._cue_dict(self._cue_at(song.current_song_time))
+        else:
+            raise CommandError(
+                "Unknown cue_point action: %s (use jump, next, previous or delete)"
+                % (action,), "invalid_value")
+        return {
+            "action": action,
+            "cue": info,
+            "current_song_time": float(song.current_song_time),
+        }
+
+    def _delete_cue(self, cue_time):
+        """set_or_delete_cue deletes the cue under the playhead, so move the
+        playhead onto it first and put it back afterwards."""
+        song = self._song
+        original_time = song.current_song_time
+        song.current_song_time = cue_time
+        try:
+            if not song.is_cue_point_selected():
+                raise CommandError("could not select cue", "internal_error")
+            song.set_or_delete_cue()
+        finally:
+            song.current_song_time = original_time
+
+    def _set_arrangement_loop(self, enabled=None, start=None, length=None):
+        """Set the arrangement loop switch and/or its start and length (beats)."""
+        song = self._song
+        if start is not None:
+            start = float(start)
+            if start < 0:
+                raise CommandError("Loop start must be >= 0 (got %s)" % start, "invalid_value")
+        if length is not None:
+            length = float(length)
+            if length <= 0:
+                raise CommandError("Loop length must be > 0 (got %s)" % length, "invalid_value")
+        if start is not None:
+            song.loop_start = start
+        if length is not None:
+            song.loop_length = length
+        if enabled is not None:
+            song.loop = bool(enabled)
+        return {
+            "enabled": bool(song.loop),
+            "start": float(song.loop_start),
+            "length": float(song.loop_length),
+        }
+
+    def _check_arrangement_overlap(self, track, start, end=None):
+        """Raise clip_overlap if an arrangement clip overlaps [start, end).
+
+        Without an end (length unknown, e.g. before an audio import) only a
+        clip covering start counts.
+        """
+        for index, clip in enumerate(self._arrangement_clips(track)):
+            clip_start = float(clip.start_time)
+            clip_end = float(clip.end_time)
+            if end is None:
+                overlaps = clip_start <= start < clip_end
+            else:
+                overlaps = clip_start < end and clip_end > start
+            if overlaps:
+                raise CommandError(
+                    "Overlaps arrangement clip %d '%s' (%s-%s); pass allow_overlap "
+                    "to place it anyway" % (index, clip.name, clip_start, clip_end),
+                    "clip_overlap")
+
+    def _find_new_arrangement_clip(self, track, before, start, created=None):
+        """(index, clip) of a clip just added to the track's arrangement.
+
+        Prefer the clip Live returned; otherwise the clip at start that was
+        not there before (create_audio_clip returns None).
+        """
+        clips = self._arrangement_clips(track)
+        if created is not None:
+            for index, clip in enumerate(clips):
+                if clip == created:
+                    return index, clip
+        for index, clip in enumerate(clips):
+            if abs(float(clip.start_time) - start) > self._TIME_TOLERANCE:
+                continue
+            if not any(clip == old for old in before):
+                return index, clip
+        raise CommandError(
+            "Could not find the new arrangement clip at %s" % start, "internal_error")
+
+    def _create_arrangement_midi_clip(self, track_index, start, length, notes=None,
+                                      name=None, allow_overlap=False):
+        """Create a MIDI clip in the arrangement, with optional notes and name.
+
+        Live 12 has Track.create_midi_clip. Live 11 does not, so build the clip
+        in a free Session slot, duplicate it to the arrangement and delete the
+        temporary Session clip. The command runs as one undo step either way.
+        """
+        try:
+            track = self._get_track(track_index)
+            if not getattr(track, "has_midi_input", False):
+                raise CommandError("Track %d is not a MIDI track" % track_index, "not_midi_track")
+            start = float(start)
+            length = float(length)
+            if start < 0:
+                raise CommandError("Start must be >= 0 (got %s)" % start, "invalid_value")
+            if length <= 0:
+                raise CommandError("Length must be > 0 (got %s)" % length, "invalid_value")
+            notes = notes or []
+            if not allow_overlap:
+                self._check_arrangement_overlap(track, start, start + length)
+
+            before = self._arrangement_clips(track)
+            if hasattr(track, "create_midi_clip"):
+                method = "create_midi_clip"
+                created = track.create_midi_clip(start, length)
+                index, clip = self._find_new_arrangement_clip(track, before, start, created)
+                if name:
+                    clip.name = str(name)
+                self._add_notes(clip, notes)
+            else:
+                method = "session_fallback"
+                slot = None
+                for candidate in track.clip_slots:
+                    if not candidate.has_clip:
+                        slot = candidate
+                        break
+                if slot is None:
+                    raise CommandError(
+                        "Track %d has no empty Session clip slot to build the clip in "
+                        "(this Live has no Track.create_midi_clip)" % track_index,
+                        "no_free_clip_slot")
+                slot.create_clip(length)
+                try:
+                    temp = slot.clip
+                    if name:
+                        temp.name = str(name)
+                    self._add_notes(temp, notes)
+                    created = track.duplicate_clip_to_arrangement(temp, start)
+                finally:
+                    if slot.has_clip:
+                        slot.delete_clip()
+                index, clip = self._find_new_arrangement_clip(track, before, start, created)
+
+            return {
+                "track_index": track_index,
+                "clip_index": index,
+                "name": str(clip.name),
+                "start_time": float(clip.start_time),
+                "end_time": float(clip.end_time),
+                "note_count": len(notes),
+                "method": method,
+            }
+        except Exception as e:
+            self.log_message("Error creating arrangement MIDI clip: " + str(e))
+            raise
+
+    def _create_arrangement_audio_clip(self, track_index, path, start, allow_overlap=False):
+        """Import an audio file into the arrangement with Track.create_audio_clip."""
+        try:
+            if not path:
+                raise CommandError("Audio file path is required", "invalid_audio_file")
+            if not os.path.isabs(path):
+                raise CommandError(
+                    "Audio file path must be absolute (got: %s)" % path, "invalid_audio_file")
+            if not os.path.isfile(path):
+                raise CommandError("Audio file not found: %s" % path, "invalid_audio_file")
+
+            track = self._get_track(track_index)
+            if getattr(track, "has_midi_input", False) or not getattr(track, "has_audio_input", True):
+                raise CommandError("Track %d is not an audio track" % track_index, "not_audio_track")
+            start = float(start)
+            if start < 0 or start > self._MAX_ARRANGEMENT_TIME:
+                raise CommandError(
+                    "Start must be between 0 and %s beats (got %s)"
+                    % (self._MAX_ARRANGEMENT_TIME, start), "invalid_value")
+            if not hasattr(track, "create_audio_clip"):
+                raise CommandError(
+                    "Track.create_audio_clip is unavailable in this Ableton Live version",
+                    "not_supported")
+            if not allow_overlap:
+                self._check_arrangement_overlap(track, start)
+
+            before = self._arrangement_clips(track)
+            track.create_audio_clip(path, start)
+            index, clip = self._find_new_arrangement_clip(track, before, start)
+            return {
+                "track_index": track_index,
+                "clip_index": index,
+                "name": str(clip.name),
+                "start_time": float(clip.start_time),
+                "end_time": float(clip.end_time),
+                "length": float(clip.length),
+            }
+        except Exception as e:
+            self.log_message("Error creating arrangement audio clip: " + str(e))
+            raise
+
+    # key -> cast, in the order they are applied. warping comes before the
+    # markers because it changes their unit (beats vs seconds).
+    _CLIP_PROPERTIES = (
+        ("name", str),
+        ("muted", bool),
+        ("color", int),
+        ("looping", bool),
+        ("warping", bool),
+        ("warp_mode", int),
+        ("loop_start", float),
+        ("loop_end", float),
+        ("start_marker", float),
+        ("end_marker", float),
+        ("gain", float),
+        ("pitch_coarse", int),
+        ("pitch_fine", float),
+    )
+    _AUDIO_ONLY_CLIP_PROPERTIES = frozenset(
+        ["gain", "pitch_coarse", "pitch_fine", "warping", "warp_mode"])
+    _MARKER_PAIRS = (("loop_start", "loop_end"), ("start_marker", "end_marker"))
+
+    def _set_clip_properties(self, track_index, clip_index, view=None, properties=None):
+        """Set several clip properties at once; all are validated first."""
+        try:
+            casts = dict(self._CLIP_PROPERTIES)
+            allowed = [key for key, _cast in self._CLIP_PROPERTIES]
+            if not isinstance(properties, dict) or not properties:
+                raise CommandError(
+                    "properties must be a non-empty object with any of: %s"
+                    % ", ".join(allowed), "invalid_value")
+            unknown = sorted(key for key in properties if key not in casts)
+            if unknown:
+                raise CommandError(
+                    "Unknown clip properties: %s. Allowed: %s"
+                    % (", ".join(unknown), ", ".join(allowed)), "invalid_value")
+
+            clip = self._resolve_clip(track_index, clip_index, view)
+            if getattr(clip, "is_midi_clip", False):
+                audio_only = sorted(set(properties) & self._AUDIO_ONLY_CLIP_PROPERTIES)
+                if audio_only:
+                    raise CommandError(
+                        "Audio-clip-only properties on a MIDI clip: %s"
+                        % ", ".join(audio_only), "not_audio_clip")
+
+            values = {}
+            for key, value in properties.items():
+                try:
+                    values[key] = casts[key](value)
+                except (TypeError, ValueError):
+                    raise CommandError(
+                        "Invalid value for %s: %r" % (key, value), "invalid_value")
+            for low, high in self._MARKER_PAIRS:
+                if low in values and high in values and values[low] >= values[high]:
+                    raise CommandError(
+                        "%s must be less than %s" % (low, high), "invalid_value")
+
+            order = [key for key in allowed if key in values]
+            for low, high in self._MARKER_PAIRS:
+                # Live rejects low >= high at every step: when both move, set
+                # first whichever one keeps the pair valid against the other's
+                # current value.
+                if low in values and high in values \
+                        and values[low] >= float(getattr(clip, high)):
+                    i, j = order.index(low), order.index(high)
+                    order[i], order[j] = high, low
+
+            for key in order:
+                setattr(clip, key, values[key])
+
+            return {"properties": dict(
+                (key, casts[key](getattr(clip, key))) for key in properties)}
+        except Exception as e:
+            self.log_message("Error setting clip properties: " + str(e))
             raise
 
     # ── Browser implementations ───────────────────────────────────────────────
@@ -2657,17 +3082,9 @@ class AbletonMCP(ControlSurface):
             self.log_message("master_track serialize failed: " + str(e))
             return None
 
-    def _get_clip_notes(self, track_index, clip_index):
+    def _get_clip_notes(self, track_index, clip_index, view=None):
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            track = self._song.tracks[track_index]
-            if clip_index < 0 or clip_index >= len(track.clip_slots):
-                raise IndexError("Clip index out of range")
-            slot = track.clip_slots[clip_index]
-            if not slot.has_clip:
-                raise Exception("No clip in slot")
-            clip = slot.clip
+            clip = self._resolve_clip(track_index, clip_index, view)
             if not getattr(clip, "is_midi_clip", False):
                 raise Exception("Clip is not a MIDI clip")
             notes = self._notes_from_clip(clip)

@@ -236,7 +236,7 @@ def test_every_previously_routed_command_is_still_routed(script):
 
 def test_every_advertised_capability_is_routed(script):
     """The handshake advertises SCRIPT_CAPABILITIES; each must be callable."""
-    advertised = set(script.SCRIPT_CAPABILITIES) - {"error_codes"}
+    advertised = set(script.SCRIPT_CAPABILITIES) - {"error_codes", "clip_view_param"}
     assert not advertised - _routed(make_instance(script))
 
 

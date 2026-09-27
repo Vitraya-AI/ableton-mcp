@@ -8,12 +8,13 @@ import re
 import threading
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, List, Union
+from typing import AsyncIterator, Dict, Any, List, Optional, Union
 
 from .telemetry import record_startup
 from .telemetry_decorator import telemetry_tool, rich_telemetry_tool
 from .dataset import dataset_enabled, get_recorder
 from .dataset.trajectory_decorator import trajectory_tool
+from . import timing
 
 ABLETON_HOST = os.environ.get("ABLETON_HOST", "localhost")
 ABLETON_PORT = int(os.environ.get("ABLETON_PORT", "9877"))
@@ -168,6 +169,8 @@ class AbletonConnection:
             "set_track_solo", "set_track_arm", "set_send_level",
             "set_master_volume", "set_master_panning",
             "create_scene", "fire_scene", "delete_scene", "set_scene_name",
+            "cue_point", "set_arrangement_loop", "create_arrangement_midi_clip",
+            "create_arrangement_audio_clip", "set_clip_properties",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -176,6 +179,7 @@ class AbletonConnection:
         # out before the Remote Script's own queue does.
         long_running_commands = {
             "create_audio_clip": 65.0,
+            "create_arrangement_audio_clip": 65.0,
             # Introspects a whole Live module; large modules take a while.
             "dump_live_api": 60.0,
         }
@@ -454,6 +458,60 @@ def _send_gated(command_type: str, params: Dict[str, Any] = None):
         return None, missing
     return get_ableton_connection().send_command(command_type, params or {}), None
 
+
+_CLIP_VIEWS = ("session", "arrangement")
+
+
+def _apply_clip_view(params: Dict[str, Any], view: str) -> str | None:
+    """Add ``view`` to params when it is not the default "session".
+
+    Returns a missing-capability message when the Remote Script predates the
+    view parameter (it would silently act on a Session clip instead), else
+    None. Raises ValueError on an unknown view.
+    """
+    if view not in _CLIP_VIEWS:
+        raise ValueError(f"view must be 'session' or 'arrangement', got {view!r}")
+    if view == "session":
+        return None
+    from .script_handshake import require_capability
+
+    missing = require_capability("clip_view_param")
+    if missing:
+        return missing
+    params["view"] = view
+    return None
+
+
+def _clip_label(clip_index: int, view: str = "session") -> str:
+    return f"arrangement clip {clip_index}" if view == "arrangement" else f"slot {clip_index}"
+
+
+def _reject_both(value, bar_value, name: str, bar_name: str) -> None:
+    if value is not None and bar_value is not None:
+        raise ValueError(f"Give {name} or {bar_name}, not both")
+
+
+def _require_one(value, bar_value, name: str, bar_name: str) -> None:
+    _reject_both(value, bar_value, name, bar_name)
+    if value is None and bar_value is None:
+        raise ValueError(f"Give {name} (beats) or {bar_name}")
+
+
+def _time_signature_for(*bar_args) -> tuple[int, int]:
+    """The song's time signature, fetched from Live only if a bar argument
+    was given (otherwise 4/4, which beat-only conversions ignore)."""
+    if all(arg is None for arg in bar_args):
+        return 4, 4
+    info = get_ableton_connection().send_command("get_session_info")
+    return int(info["signature_numerator"]), int(info["signature_denominator"])
+
+
+def _bar_or_none(beat, numerator: int, denominator: int):
+    try:
+        return round(timing.beat_to_bar(float(beat), numerator, denominator), 6)
+    except (TypeError, ValueError):
+        return None
+
 NoteValue = Union[int, float, bool, str]
 
 
@@ -583,16 +641,20 @@ def get_clip_notes(
     ctx: Context,
     track_index: int,
     clip_index: int,
+    view: str = "session",
     user_prompt: str = "",
 ) -> str:
     """
-    Read all MIDI notes from a Session-view clip.
+    Read all MIDI notes from a Session or Arrangement clip.
 
     Returns pitch, start_time, duration, velocity, mute (and extended fields when available).
 
     Parameters:
     - track_index: Track that owns the clip
-    - clip_index: Session clip slot index
+    - clip_index: Session clip slot index (or arrangement clip index, see view)
+    - view: "session" (default) or "arrangement". With "arrangement",
+      clip_index indexes the track's arrangement clips in get_arrangement_info
+      order (by start time).
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
@@ -601,11 +663,12 @@ def get_clip_notes(
         missing = require_capability("get_clip_notes")
         if missing:
             return missing
+        params = {"track_index": track_index, "clip_index": clip_index}
+        missing = _apply_clip_view(params, view)
+        if missing:
+            return missing
         ableton = get_ableton_connection()
-        result = ableton.send_command(
-            "get_clip_notes",
-            {"track_index": track_index, "clip_index": clip_index},
-        )
+        result = ableton.send_command("get_clip_notes", params)
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error getting clip notes: {str(e)}")
@@ -852,6 +915,7 @@ def add_notes_to_clip(
     track_index: int,
     clip_index: int,
     notes: List[Dict[str, NoteValue]],
+    view: str = "session",
     user_prompt: str = ""
 ) -> str:
     """
@@ -863,16 +927,23 @@ def add_notes_to_clip(
     - notes: List of note dictionaries, each with pitch, start_time, duration, velocity, and mute.
       pitch may be a MIDI number or a note name in Ableton's convention (C3 = 60), e.g. "Eb2".
       Optional on Live 11+: probability (0.0-1.0), velocity_deviation, release_velocity.
+    - view: "session" (default) or "arrangement". With "arrangement",
+      clip_index indexes the track's arrangement clips in get_arrangement_info
+      order (by start time).
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
-        ableton = get_ableton_connection()
-        result = ableton.send_command("add_notes_to_clip", {
+        params = {
             "track_index": track_index,
             "clip_index": clip_index,
             "notes": _parse_note_pitches(notes)
-        })
-        return f"Added {len(notes)} notes to clip at track {track_index}, slot {clip_index}"
+        }
+        missing = _apply_clip_view(params, view)
+        if missing:
+            return missing
+        ableton = get_ableton_connection()
+        result = ableton.send_command("add_notes_to_clip", params)
+        return f"Added {len(notes)} notes to clip at track {track_index}, {_clip_label(clip_index, view)}"
     except Exception as e:
         logger.error(f"Error adding notes to clip: {str(e)}")
         return f"Error adding notes to clip: {str(e)}"
@@ -883,10 +954,11 @@ def clear_notes_from_clip(
     ctx: Context,
     track_index: int,
     clip_index: int,
+    view: str = "session",
     user_prompt: str = ""
 ) -> str:
     """
-    Remove all MIDI notes from a Session clip.
+    Remove all MIDI notes from a Session or Arrangement clip.
 
     Writes are additive (add_notes_to_clip only appends), so to truly *modify*
     a clip you clear it first, then add the new notes. Use this with
@@ -897,6 +969,9 @@ def clear_notes_from_clip(
     Parameters:
     - track_index: The index of the track containing the clip
     - clip_index: The index of the clip slot containing the clip
+    - view: "session" (default) or "arrangement". With "arrangement",
+      clip_index indexes the track's arrangement clips in get_arrangement_info
+      order (by start time).
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
@@ -905,16 +980,17 @@ def clear_notes_from_clip(
         missing = require_capability("clear_notes_from_clip")
         if missing:
             return missing
+        params = {"track_index": track_index, "clip_index": clip_index}
+        missing = _apply_clip_view(params, view)
+        if missing:
+            return missing
         ableton = get_ableton_connection()
-        result = ableton.send_command("clear_notes_from_clip", {
-            "track_index": track_index,
-            "clip_index": clip_index
-        })
-        return "Cleared {n} note(s) from clip '{name}' (track {t}, slot {c})".format(
+        result = ableton.send_command("clear_notes_from_clip", params)
+        return "Cleared {n} note(s) from clip '{name}' (track {t}, {c})".format(
             n=result.get("cleared_count", "?"),
             name=result.get("clip_name", "clip"),
             t=track_index,
-            c=clip_index,
+            c=_clip_label(clip_index, view),
         )
     except Exception as e:
         logger.error(f"Error clearing notes from clip: {str(e)}")
@@ -928,6 +1004,7 @@ def modify_clip_notes(
     track_index: int,
     clip_index: int,
     notes: List[Dict[str, NoteValue]],
+    view: str = "session",
     user_prompt: str = ""
 ) -> str:
     """
@@ -943,18 +1020,25 @@ def modify_clip_notes(
     - clip_index: The index of the clip slot containing the clip
     - notes: Note dictionaries, each with note_id plus the fields to change.
       pitch may be a note name (C3 = 60).
+    - view: "session" (default) or "arrangement". With "arrangement",
+      clip_index indexes the track's arrangement clips in get_arrangement_info
+      order (by start time).
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
-        result, missing = _send_gated("modify_clip_notes", {
+        params = {
             "track_index": track_index,
             "clip_index": clip_index,
             "notes": _parse_note_pitches(notes),
-        })
+        }
+        missing = _apply_clip_view(params, view)
+        if missing:
+            return missing
+        result, missing = _send_gated("modify_clip_notes", params)
         if missing:
             return missing
         return (f"Modified {result.get('modified_count', len(notes))} note(s) "
-                f"in clip at track {track_index}, slot {clip_index}")
+                f"in clip at track {track_index}, {_clip_label(clip_index, view)}")
     except Exception as e:
         logger.error(f"Error modifying clip notes: {str(e)}")
         return f"Error modifying clip notes: {str(e)}"
@@ -970,6 +1054,7 @@ def remove_notes_from_clip(
     time_span: float = -1.0,
     from_pitch: Union[int, str] = 0,
     pitch_span: int = 128,
+    view: str = "session",
     user_prompt: str = ""
 ) -> str:
     """
@@ -986,21 +1071,28 @@ def remove_notes_from_clip(
     - time_span: Window length in beats; negative means to the end of the clip
     - from_pitch: Lowest pitch, as a MIDI number or note name (C3 = 60)
     - pitch_span: Number of semitones from from_pitch (1-128)
+    - view: "session" (default) or "arrangement". With "arrangement",
+      clip_index indexes the track's arrangement clips in get_arrangement_info
+      order (by start time).
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
-        result, missing = _send_gated("remove_notes_from_clip", {
+        params = {
             "track_index": track_index,
             "clip_index": clip_index,
             "from_time": from_time,
             "time_span": time_span,
             "from_pitch": _parse_pitch(from_pitch),
             "pitch_span": pitch_span,
-        })
+        }
+        missing = _apply_clip_view(params, view)
+        if missing:
+            return missing
+        result, missing = _send_gated("remove_notes_from_clip", params)
         if missing:
             return missing
         return (f"Removed {result.get('removed_count', '?')} note(s) "
-                f"from clip at track {track_index}, slot {clip_index}")
+                f"from clip at track {track_index}, {_clip_label(clip_index, view)}")
     except Exception as e:
         logger.error(f"Error removing notes from clip: {str(e)}")
         return f"Error removing notes from clip: {str(e)}"
@@ -1158,16 +1250,20 @@ def stop_clip(ctx: Context, track_index: int, clip_index: int, user_prompt: str 
 
 @mcp.tool()
 @telemetry_tool("delete_clip")
-def delete_clip(ctx: Context, track_index: int, clip_index: int, user_prompt: str = "") -> str:
+def delete_clip(ctx: Context, track_index: int, clip_index: int, view: str = "session", user_prompt: str = "") -> str:
     """
-    Delete the clip in the given clip slot, freeing it for reuse.
+    Delete the clip in the given clip slot, freeing it for reuse, or delete a
+    clip from the Arrangement timeline (view="arrangement").
 
     Use this before create_clip when you want to overwrite an existing clip
     (create_clip itself refuses to write into an occupied slot).
 
     Parameters:
     - track_index: The index of the track containing the clip
-    - clip_index: The index of the clip slot to clear
+    - clip_index: The index of the clip slot to clear (or arrangement clip index)
+    - view: "session" (default) or "arrangement". With "arrangement",
+      clip_index indexes the track's arrangement clips in get_arrangement_info
+      order (by start time).
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
@@ -1176,11 +1272,12 @@ def delete_clip(ctx: Context, track_index: int, clip_index: int, user_prompt: st
         missing = require_capability("delete_clip")
         if missing:
             return missing
+        params = {"track_index": track_index, "clip_index": clip_index}
+        missing = _apply_clip_view(params, view)
+        if missing:
+            return missing
         ableton = get_ableton_connection()
-        result = ableton.send_command("delete_clip", {
-            "track_index": track_index,
-            "clip_index": clip_index,
-        })
+        result = ableton.send_command("delete_clip", params)
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error deleting clip: {str(e)}")
@@ -1955,6 +2052,316 @@ def create_locator(
     except Exception as e:
         logger.error(f"Error creating locator: {str(e)}")
         return f"Error creating locator: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("get_arrangement_info")
+@trajectory_tool("get_arrangement_info")
+def get_arrangement_info(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Overview of the whole Arrangement timeline in one call.
+
+    Returns song length, playhead (current_song_time / current_bar), loop
+    (enabled, start, length), tempo, time signature, cue points (index, name,
+    time, bar; sorted by time) and, for every track, its arrangement clips
+    (index, name, start_time/end_time in beats, start_bar/end_bar, length,
+    is_midi_clip, muted). Clip indexes are the ones to pass as clip_index with
+    view="arrangement". Bars follow Live's ruler (bar 1 = beat 0) and use the
+    current time signature.
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result, missing = _send_gated("get_arrangement_info")
+        if missing:
+            return missing
+        try:
+            num = int(result["signature_numerator"])
+            den = int(result["signature_denominator"])
+            timing.beats_per_bar(num, den)
+        except (KeyError, TypeError, ValueError):
+            return json.dumps(result, indent=2)
+        if "current_song_time" in result:
+            result["current_bar"] = _bar_or_none(result["current_song_time"], num, den)
+        for cue in result.get("cue_points") or []:
+            cue["bar"] = _bar_or_none(cue.get("time"), num, den)
+        for track in result.get("tracks") or []:
+            for clip in track.get("clips") or []:
+                clip["start_bar"] = _bar_or_none(clip.get("start_time"), num, den)
+                clip["end_bar"] = _bar_or_none(clip.get("end_time"), num, den)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting arrangement info: {str(e)}")
+        return f"Error getting arrangement info: {str(e)}"
+
+
+_CUE_ACTIONS = ("jump", "next", "previous", "delete")
+
+
+@mcp.tool()
+@rich_telemetry_tool("cue_point")
+@trajectory_tool("cue_point")
+def cue_point(
+    ctx: Context,
+    action: str,
+    name: Optional[str] = None,
+    time: Optional[float] = None,
+    bar: Optional[float] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Jump between or delete Arrangement cue points (locators).
+
+    Use create_locator to add one.
+
+    Parameters:
+    - action: "jump" (to the cue named `name`, or the one nearest `time`/`bar`),
+      "next", "previous", or "delete" (the cue named `name`, or the one at
+      `time`/`bar`). Deleting leaves the playhead where it was.
+    - name: Cue name (case-insensitive exact match)
+    - time: Position in beats
+    - bar: Position as a bar number instead of time (bar 1 = beat 0; 2.5 = half way through bar 2)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        if action not in _CUE_ACTIONS:
+            raise ValueError(f"action must be one of {', '.join(_CUE_ACTIONS)}, got {action!r}")
+        _reject_both(time, bar, "time", "bar")
+        if bar is not None:
+            time = timing.bar_to_beat(bar, *_time_signature_for(bar))
+        result, missing = _send_gated("cue_point", {"action": action, "name": name, "time": time})
+        if missing:
+            return missing
+        cue = result.get("cue")
+        playhead = result.get("current_song_time")
+        if action == "delete":
+            return f"Deleted cue '{cue.get('name')}' at beat {cue.get('time')}" if cue else "Deleted cue"
+        if cue:
+            return f"Jumped to cue '{cue.get('name')}' at beat {cue.get('time')}"
+        return f"Jumped to {action} cue; playhead at beat {playhead}"
+    except Exception as e:
+        logger.error(f"Error with cue point: {str(e)}")
+        return f"Error with cue point: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_arrangement_loop")
+@trajectory_tool("set_arrangement_loop")
+def set_arrangement_loop(
+    ctx: Context,
+    enabled: bool,
+    start: Optional[float] = None,
+    length: Optional[float] = None,
+    start_bar: Optional[float] = None,
+    length_bars: Optional[float] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Turn the Arrangement loop on or off and optionally move or resize it.
+
+    Parameters:
+    - enabled: Loop on (True) or off (False)
+    - start: Loop start in beats (>= 0); omit to keep the current start
+    - length: Loop length in beats (> 0); omit to keep the current length
+    - start_bar: Loop start as a bar number instead of start (bar 1 = beat 0)
+    - length_bars: Loop length in bars instead of length
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        _reject_both(start, start_bar, "start", "start_bar")
+        _reject_both(length, length_bars, "length", "length_bars")
+        num, den = _time_signature_for(start_bar, length_bars)
+        if start is not None or start_bar is not None:
+            start = timing.resolve_position(beat=start, bar=start_bar,
+                                            numerator=num, denominator=den)
+        if length is not None or length_bars is not None:
+            length = timing.resolve_length(beats=length, bars=length_bars,
+                                           numerator=num, denominator=den)
+        result, missing = _send_gated("set_arrangement_loop", {
+            "enabled": enabled, "start": start, "length": length,
+        })
+        if missing:
+            return missing
+        return "Arrangement loop {state}: start beat {s}, length {l} beats".format(
+            state="on" if result.get("enabled", enabled) else "off",
+            s=result.get("start", start),
+            l=result.get("length", length),
+        )
+    except Exception as e:
+        logger.error(f"Error setting arrangement loop: {str(e)}")
+        return f"Error setting arrangement loop: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("create_arrangement_midi_clip", capture_notes=True)
+@trajectory_tool("create_arrangement_midi_clip")
+def create_arrangement_midi_clip(
+    ctx: Context,
+    track_index: int,
+    start: Optional[float] = None,
+    length: Optional[float] = None,
+    start_bar: Optional[float] = None,
+    length_bars: Optional[float] = None,
+    notes: Optional[List[Dict[str, NoteValue]]] = None,
+    name: Optional[str] = None,
+    allow_overlap: bool = False,
+    user_prompt: str = ""
+) -> str:
+    """
+    Create a MIDI clip directly in the Arrangement timeline, optionally with notes.
+
+    On Live 12 this uses Track.create_midi_clip. Live 11 has no such API, so
+    the clip is built in a temporary Session clip, copied to the Arrangement
+    and the temporary clip deleted — this needs one free Session clip slot on
+    that track (error no_free_clip_slot otherwise). Either way it is one undo
+    step. MIDI tracks only. Refuses to overlap an existing arrangement clip
+    (error clip_overlap) unless allow_overlap=True.
+
+    Parameters:
+    - track_index: The MIDI track to place the clip on
+    - start: Start position in beats (give this or start_bar)
+    - length: Length in beats (give this or length_bars)
+    - start_bar: Start as a bar number (bar 1 = beat 0; 2.5 = half way through bar 2)
+    - length_bars: Length in bars
+    - notes: Optional notes, same fields as add_notes_to_clip; start_time is
+      relative to the clip start. pitch may be a note name (C3 = 60).
+    - name: Optional clip name
+    - allow_overlap: Place the clip even if it overlaps an existing one
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        _require_one(start, start_bar, "start", "start_bar")
+        _require_one(length, length_bars, "length", "length_bars")
+        parsed_notes = _parse_note_pitches(notes or [])
+        num, den = _time_signature_for(start_bar, length_bars)
+        start = timing.resolve_position(beat=start, bar=start_bar,
+                                        numerator=num, denominator=den)
+        length = timing.resolve_length(beats=length, bars=length_bars,
+                                       numerator=num, denominator=den)
+        result, missing = _send_gated("create_arrangement_midi_clip", {
+            "track_index": track_index,
+            "start": start,
+            "length": length,
+            "notes": parsed_notes,
+            "name": name,
+            "allow_overlap": allow_overlap,
+        })
+        if missing:
+            return missing
+        method = result.get("method")
+        via = " (via temporary Session clip)" if method == "session_fallback" else ""
+        return (
+            f"Created arrangement MIDI clip '{result.get('name', name or 'clip')}' on track "
+            f"{track_index}, beats {result.get('start_time', start)}-"
+            f"{result.get('end_time', start + length)}, arrangement clip index "
+            f"{result.get('clip_index', '?')}, {result.get('note_count', len(parsed_notes))} "
+            f"note(s){via}"
+        )
+    except Exception as e:
+        logger.error(f"Error creating arrangement MIDI clip: {str(e)}")
+        return f"Error creating arrangement MIDI clip: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("create_arrangement_audio_clip")
+@trajectory_tool("create_arrangement_audio_clip")
+def create_arrangement_audio_clip(
+    ctx: Context,
+    track_index: int,
+    path: str,
+    start: Optional[float] = None,
+    start_bar: Optional[float] = None,
+    allow_overlap: bool = False,
+    user_prompt: str = ""
+) -> str:
+    """
+    Import an audio file into the Arrangement timeline of an audio track.
+
+    Needs Track.create_audio_clip in the running Live (error not_supported
+    otherwise). A missing or unreadable file fails with invalid_audio_file.
+    Refuses to start inside an existing arrangement clip (error clip_overlap)
+    unless allow_overlap=True.
+
+    Parameters:
+    - track_index: The audio track to place the clip on
+    - path: Absolute path to a supported audio file (e.g. a .wav)
+    - start: Start position in beats (give this or start_bar)
+    - start_bar: Start as a bar number (bar 1 = beat 0)
+    - allow_overlap: Place the clip even if it overlaps an existing one
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        _require_one(start, start_bar, "start", "start_bar")
+        num, den = _time_signature_for(start_bar)
+        start = timing.resolve_position(beat=start, bar=start_bar,
+                                        numerator=num, denominator=den)
+        result, missing = _send_gated("create_arrangement_audio_clip", {
+            "track_index": track_index,
+            "path": path,
+            "start": start,
+            "allow_overlap": allow_overlap,
+        })
+        if missing:
+            return missing
+        return (
+            f"Created arrangement audio clip '{result.get('name', 'clip')}' on track "
+            f"{track_index}, beats {result.get('start_time', start)}-{result.get('end_time', '?')} "
+            f"(length {result.get('length', '?')} beats), arrangement clip index "
+            f"{result.get('clip_index', '?')}"
+        )
+    except Exception as e:
+        logger.error(f"Error creating arrangement audio clip: {str(e)}")
+        return f"Error creating arrangement audio clip: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_clip_properties")
+@trajectory_tool("set_clip_properties")
+def set_clip_properties(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    properties: Dict[str, Any],
+    view: str = "session",
+    user_prompt: str = ""
+) -> str:
+    """
+    Set several properties of a Session or Arrangement clip in one call.
+
+    Allowed keys: name, muted, color, looping, loop_start, loop_end,
+    start_marker, end_marker (all clips); gain, pitch_coarse, pitch_fine,
+    warping, warp_mode (audio clips only — error not_audio_clip on MIDI
+    clips). Loop and marker positions are in beats. All keys are checked
+    before anything changes; unknown keys fail with invalid_value. Returns the
+    values read back from Live.
+
+    Parameters:
+    - track_index: The index of the track containing the clip
+    - clip_index: Session clip slot index, or arrangement clip index (see view)
+    - properties: e.g. {"name": "Verse", "looping": true, "loop_end": 8.0}
+    - view: "session" (default) or "arrangement". With "arrangement",
+      clip_index indexes the track's arrangement clips in get_arrangement_info
+      order (by start time).
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        if view not in _CLIP_VIEWS:
+            raise ValueError(f"view must be 'session' or 'arrangement', got {view!r}")
+        result, missing = _send_gated("set_clip_properties", {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "view": view,
+            "properties": properties,
+        })
+        if missing:
+            return missing
+        values = result.get("properties", {})
+        return (f"Updated clip at track {track_index}, {_clip_label(clip_index, view)}: "
+                f"{json.dumps(values)}")
+    except Exception as e:
+        logger.error(f"Error setting clip properties: {str(e)}")
+        return f"Error setting clip properties: {str(e)}"
 
 
 # ── Dataset / preference tools (Supabase trajectory recording) ─────────────────
