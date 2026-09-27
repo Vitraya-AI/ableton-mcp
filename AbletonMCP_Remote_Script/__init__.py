@@ -2,6 +2,7 @@
 from __future__ import absolute_import, print_function, unicode_literals
 
 from _Framework.ControlSurface import ControlSurface
+import inspect
 import os
 import socket
 import json
@@ -34,7 +35,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.10.0"
+SCRIPT_VERSION = "1.10.1"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -474,36 +475,107 @@ class AbletonMCP(ControlSurface):
         }
 
     def _in_undo_step(self, handler):
-        """Run handler as one undo step, where this Live supports marking them."""
+        """Run handler as one undo step, where this Live supports marking them.
+
+        A handler that returns a generator (a multi-tick command) keeps the
+        undo step open until the generator finishes or raises, so the step
+        spans every tick rather than just the first.
+        """
         begin = getattr(self._song, "begin_undo_step", None)
         end = getattr(self._song, "end_undo_step", None)
         if begin is None or end is None:
             return handler()
         begin()
         try:
-            return handler()
+            result = handler()
+        except Exception:
+            end()
+            raise
+        if not inspect.isgenerator(result):
+            end()
+            return result
+        return self._end_undo_step_after(result, end)
+
+    @staticmethod
+    def _end_undo_step_after(steps, end):
+        try:
+            result = yield from steps
         finally:
             end()
+        return result
+
+    def _wait_for(self, predicate, max_ticks=10, raise_on_timeout=True):
+        """Generator: yield one Live tick at a time until predicate() is true.
+
+        Live applies some writes (the playhead, loop settings) only on its
+        next tick, so reading back or acting on them in the same tick sees
+        the old state. Use as ``ok = yield from self._wait_for(...)``.
+        Returns False on timeout unless raise_on_timeout.
+        """
+        for _tick in range(max_ticks):
+            if predicate():
+                return True
+            yield
+        if predicate():
+            return True
+        if raise_on_timeout:
+            raise CommandError("Live did not apply the change in time", "timeout")
+        return False
 
     def _run_on_main_thread(self, command_type, handler):
-        """Run handler on Live's main thread and wait for its outcome."""
+        """Run handler on Live's main thread and wait for its outcome.
+
+        A handler may return a generator to wait for Live between steps: each
+        yield resumes on the next tick (schedule_message(1, ...)) and the
+        generator's return value is the result. The queue timeout below
+        still bounds the whole command.
+        """
         response_queue = queue.Queue()
+        cancelled = []
         if command_type in self._UNDOABLE_COMMANDS:
             run = lambda: self._in_undo_step(handler)
         else:
             run = handler
 
+        def succeed(result):
+            response_queue.put({"status": "success", "result": result})
+
+        def fail(e):
+            self.log_message("Error in main thread task: " + str(e))
+            self.log_message(traceback.format_exc())
+            response_queue.put({
+                "status": "error",
+                "message": str(e),
+                "code": error_code_for(e),
+            })
+
+        def drive(steps):
+            def step():
+                if cancelled:
+                    # The caller already got a timeout; stop acting on Live.
+                    steps.close()
+                    return
+                try:
+                    next(steps)
+                except StopIteration as stop:
+                    succeed(stop.value)
+                    return
+                except Exception as e:
+                    fail(e)
+                    return
+                self.schedule_message(1, step)
+            step()
+
         def main_thread_task():
             try:
-                response_queue.put({"status": "success", "result": run()})
+                result = run()
             except Exception as e:
-                self.log_message("Error in main thread task: " + str(e))
-                self.log_message(traceback.format_exc())
-                response_queue.put({
-                    "status": "error",
-                    "message": str(e),
-                    "code": error_code_for(e),
-                })
+                fail(e)
+                return
+            if inspect.isgenerator(result):
+                drive(result)
+            else:
+                succeed(result)
 
         try:
             self.schedule_message(0, main_thread_task)
@@ -515,6 +587,7 @@ class AbletonMCP(ControlSurface):
         try:
             return response_queue.get(timeout=timeout)
         except queue.Empty:
+            cancelled.append(True)
             return {
                 "status": "error",
                 "message": "Timeout waiting for operation to complete",
@@ -1673,40 +1746,44 @@ class AbletonMCP(ControlSurface):
         """Create (or rename) a named locator at the given beat position.
 
         Uses Live's Song.set_or_delete_cue(), which toggles a cue at the
-        current_song_time. We temporarily move the playhead, toggle, then
-        restore. If a cue already exists at that time we just rename it
-        instead of toggling (which would delete it).
+        playhead. Live moves the playhead on its next tick, so move it, wait
+        until it is there, toggle, wait for the cue, then restore. If a cue
+        already exists at that time just rename it instead of toggling (which
+        would delete it). A generator: see _run_on_main_thread.
         """
         try:
             song = self._song
             target_time = float(time_val)
-            tolerance = 1e-3
-
-            # See if a cue already exists at (or near) the target time
-            existing = None
-            for cue in song.cue_points:
-                if abs(cue.time - target_time) < tolerance:
-                    existing = cue
-                    break
-
-            original_time = song.current_song_time
+            existing = self._cue_at(target_time)
 
             if existing is None:
-                # Move playhead, toggle to create, then locate the new cue
-                song.current_song_time = target_time
-                song.set_or_delete_cue()
-                for cue in song.cue_points:
-                    if abs(cue.time - target_time) < tolerance:
-                        existing = cue
-                        break
-                # Restore playhead
+                original_time = song.current_song_time
                 try:
-                    song.current_song_time = original_time
+                    yield from self._move_playhead(target_time)
+                    if song.is_cue_point_selected():
+                        # Never toggle a cue we did not find: that would delete it.
+                        raise CommandError(
+                            "A cue is selected at %s although none was found at %s; "
+                            "not toggling" % (song.current_song_time, target_time),
+                            "internal_error")
+                    count_before = len(song.cue_points)
+                    song.set_or_delete_cue()
+                    created = yield from self._wait_for(
+                        lambda: self._cue_at(target_time) is not None,
+                        raise_on_timeout=False)
+                    self.log_message(
+                        "create_locator: toggled at %s, cues %d -> %d, created=%s"
+                        % (song.current_song_time, count_before,
+                           len(song.cue_points), created))
+                    if not created:
+                        raise CommandError(
+                            "Failed to create cue at time %s (Live did not add one "
+                            "at the playhead)" % target_time, "internal_error")
                 except Exception:
-                    pass
-
-            if existing is None:
-                raise Exception("Failed to create cue at time " + str(target_time))
+                    song.current_song_time = original_time
+                    raise
+                yield from self._restore_playhead(original_time)
+                existing = self._cue_at(target_time)
 
             if name:
                 try:
@@ -1722,6 +1799,31 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error creating locator: " + str(e))
             raise
+
+    def _playhead_at(self, time_val):
+        return abs(float(self._song.current_song_time) - float(time_val)) <= self._TIME_TOLERANCE
+
+    def _move_playhead(self, time_val):
+        """Generator: move the playhead and wait until Live has moved it."""
+        self.log_message("playhead: %s -> %s" % (self._song.current_song_time, time_val))
+        self._song.current_song_time = float(time_val)
+        landed = yield from self._wait_for(
+            lambda: self._playhead_at(time_val), raise_on_timeout=False)
+        self.log_message("playhead: at %s (target %s, landed=%s)"
+                         % (self._song.current_song_time, time_val, landed))
+        if not landed:
+            raise CommandError(
+                "Could not move the playhead to %s (it is at %s)"
+                % (time_val, self._song.current_song_time), "timeout")
+
+    def _restore_playhead(self, time_val):
+        """Generator: put the playhead back; best effort, never raises."""
+        self._song.current_song_time = time_val
+        restored = yield from self._wait_for(
+            lambda: self._playhead_at(time_val), raise_on_timeout=False)
+        if not restored:
+            self.log_message("playhead: could not restore to %s (at %s)"
+                             % (time_val, self._song.current_song_time))
 
     # ── Arrangement ─────────────────────────────────────────────────────────
 
@@ -1742,7 +1844,9 @@ class AbletonMCP(ControlSurface):
                     "name": str(clip.name),
                     "start_time": float(clip.start_time),
                     "end_time": float(clip.end_time),
-                    "length": float(clip.length),
+                    # Timeline length; Clip.length is the loop length.
+                    "length": float(clip.end_time) - float(clip.start_time),
+                    "loop_length": float(clip.length),
                     "is_midi_clip": bool(getattr(clip, "is_midi_clip", False)),
                     "muted": bool(getattr(clip, "muted", False)),
                 })
@@ -1817,6 +1921,7 @@ class AbletonMCP(ControlSurface):
         delete runs inside one.
         """
         song = self._song
+        before = song.current_song_time
         if action in ("jump", "delete"):
             if name is None and time_val is None:
                 raise CommandError(
@@ -1825,13 +1930,21 @@ class AbletonMCP(ControlSurface):
             info = self._cue_dict(cue)
             if action == "jump":
                 cue.jump()
+                # While playing, the jump is quantized, so it may land later.
+                yield from self._wait_for(
+                    lambda: self._playhead_at(info["time"]), max_ticks=3,
+                    raise_on_timeout=False)
             else:
-                self._in_undo_step(lambda: self._delete_cue(info["time"]))
-        elif action == "next":
-            song.jump_to_next_cue()
-            info = self._cue_dict(self._cue_at(song.current_song_time))
-        elif action == "previous":
-            song.jump_to_prev_cue()
+                yield from self._in_undo_step(lambda: self._delete_cue(info["time"]))
+        elif action in ("next", "previous"):
+            if action == "next":
+                song.jump_to_next_cue()
+            else:
+                song.jump_to_prev_cue()
+            # Report where Live actually landed, not the playhead of this tick.
+            yield from self._wait_for(
+                lambda: song.current_song_time != before, max_ticks=3,
+                raise_on_timeout=False)
             info = self._cue_dict(self._cue_at(song.current_song_time))
         else:
             raise CommandError(
@@ -1844,17 +1957,35 @@ class AbletonMCP(ControlSurface):
         }
 
     def _delete_cue(self, cue_time):
-        """set_or_delete_cue deletes the cue under the playhead, so move the
-        playhead onto it first and put it back afterwards."""
+        """Generator: delete the cue at cue_time.
+
+        set_or_delete_cue toggles at the playhead: it deletes the selected cue
+        or, when none is selected, adds one. So move the playhead onto the cue,
+        wait until Live has moved it, and toggle only when the playhead is on
+        the target and Live reports a cue selected. Restore the playhead after.
+        """
         song = self._song
         original_time = song.current_song_time
-        song.current_song_time = cue_time
         try:
-            if not song.is_cue_point_selected():
+            yield from self._move_playhead(cue_time)
+            selected = song.is_cue_point_selected()
+            count_before = len(song.cue_points)
+            self.log_message("cue delete: target %s, playhead %s, selected=%s, cues=%d"
+                             % (cue_time, song.current_song_time, selected, count_before))
+            if not (selected and self._playhead_at(cue_time)):
                 raise CommandError("could not select cue", "internal_error")
             song.set_or_delete_cue()
-        finally:
+            gone = yield from self._wait_for(
+                lambda: self._cue_at(cue_time) is None, raise_on_timeout=False)
+            self.log_message("cue delete: cues %d -> %d, gone=%s"
+                             % (count_before, len(song.cue_points), gone))
+            if not gone:
+                raise CommandError(
+                    "Live did not delete the cue at %s" % cue_time, "timeout")
+        except Exception:
             song.current_song_time = original_time
+            raise
+        yield from self._restore_playhead(original_time)
 
     def _set_arrangement_loop(self, enabled=None, start=None, length=None):
         """Set the arrangement loop switch and/or its start and length (beats)."""
@@ -1873,6 +2004,12 @@ class AbletonMCP(ControlSurface):
             song.loop_length = length
         if enabled is not None:
             song.loop = bool(enabled)
+        # Live applies these on its next tick; reading back now sees old values.
+        yield from self._wait_for(
+            lambda: (enabled is None or bool(song.loop) == bool(enabled))
+            and (start is None or abs(float(song.loop_start) - start) <= self._TIME_TOLERANCE)
+            and (length is None or abs(float(song.loop_length) - length) <= self._TIME_TOLERANCE),
+            max_ticks=5, raise_on_timeout=False)
         return {
             "enabled": bool(song.loop),
             "start": float(song.loop_start),
@@ -1925,6 +2062,7 @@ class AbletonMCP(ControlSurface):
         in a free Session slot, duplicate it to the arrangement and delete the
         temporary Session clip. The command runs as one undo step either way.
         """
+        original_time = None
         try:
             track = self._get_track(track_index)
             if not getattr(track, "has_midi_input", False):
@@ -1940,6 +2078,7 @@ class AbletonMCP(ControlSurface):
                 self._check_arrangement_overlap(track, start, start + length)
 
             before = self._arrangement_clips(track)
+            original_time = self._song.current_song_time
             if hasattr(track, "create_midi_clip"):
                 method = "create_midi_clip"
                 created = track.create_midi_clip(start, length)
@@ -1971,6 +2110,10 @@ class AbletonMCP(ControlSurface):
                         slot.delete_clip()
                 index, clip = self._find_new_arrangement_clip(track, before, start, created)
 
+            # duplicate_clip_to_arrangement moves the playhead to the new clip
+            # (on the next tick); put it back where the user left it.
+            yield
+            yield from self._restore_playhead(original_time)
             return {
                 "track_index": track_index,
                 "clip_index": index,
@@ -1982,6 +2125,8 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error creating arrangement MIDI clip: " + str(e))
+            if original_time is not None:
+                self._song.current_song_time = original_time
             raise
 
     def _create_arrangement_audio_clip(self, track_index, path, start, allow_overlap=False):
@@ -2094,6 +2239,8 @@ class AbletonMCP(ControlSurface):
             for key in order:
                 setattr(clip, key, values[key])
 
+            # Let Live apply the writes before reading them back.
+            yield
             return {"properties": dict(
                 (key, casts[key](getattr(clip, key))) for key in properties)}
         except Exception as e:

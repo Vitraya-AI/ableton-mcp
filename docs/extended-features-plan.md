@@ -1,6 +1,6 @@
 # Extended Features Port — Plan
 
-Status: **Phases 0–1 done (Remote Script 1.10.0); Phase 1 awaiting Live checks; next is Phase 2** (written 2026-09-26). Work happens on the
+Status: **Phases 0–1 done (Remote Script 1.10.1); Phase 1 fixes awaiting a Live re-check; next is Phase 2** (written 2026-09-26). Work happens on the
 `extended-features` branch. This document is the hand-off: a new session should
 be able to start Phase 0 from here without the conversation that produced it.
 
@@ -111,7 +111,24 @@ on Live 11; the temporary Session clip is always removed in a `finally`;
 Session `delete_clip` keeps returning `{"deleted": false}` for an empty slot;
 `set_clip_properties` sets `warping` before markers (it changes their unit).
 Tool list: 56 tools, ~10.9k tokens (up from ~8.3k).
-**Still to do in Live:** the "Arrangement (1.10.0)" smoke checks.
+Live test of 1.10.0 (2026-09-27): everything passed except commands that
+move the playhead and then act, or read back, in the same tick — Live applies
+`current_song_time` / loop writes on its next update. Upstream's
+`create_locator` and our cue delete toggled cues at the old playhead
+(stray cues), `cue_point next` misreported, the loop read back "off", and the
+Live 11 MIDI-clip fallback left the playhead moved. **Fixed in 1.10.1:**
+`_run_on_main_thread` accepts generator handlers that resume on a later
+tick (`schedule_message(1, …)`, verified against Live 11's
+`_Framework/ControlSurface.py`), `_wait_for` polls until Live applies a
+change, undo steps span the whole command, and cue toggles only happen when
+the target cue is selected. `get_arrangement_info` clips now report the
+timeline `length` plus `loop_length`. Server: browser depth clamped before
+sending; MIDI clip output shows `(method: …)`.
+**Still to do in Live:** re-run "Arrangement (1.10.1)", especially step 7.
+
+**Rule for new commands:** anything that writes a Live property and then
+depends on it in the same command (playhead, loop, markers…) must be a
+generator handler that waits for Live (`yield from self._wait_for(...)`).
 
 Existing arrangement tools in the fork, keep as they are: `create_locator`,
 `duplicate_to_arrangement`, `get_arrangement_clips`, `set_arrangement_time`,

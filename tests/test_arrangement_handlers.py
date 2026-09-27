@@ -7,6 +7,10 @@ set_clip_properties, and the view parameter on the note tools and delete_clip.
 Same setup as test_remote_script_handlers.py: ``_Framework`` is stubbed, the
 class is built without ``__init__``, schedule_message runs the task
 immediately, and the Live object model is replaced with small fakes.
+
+Like Live, the fakes apply some writes (the playhead, loop settings, a few
+clip properties) only on the next tick: they stay pending until
+schedule_message runs a task scheduled with a delay of 1 or more.
 """
 
 import importlib.util
@@ -81,8 +85,13 @@ class FakeNote(object):
 class FakeClip(object):
     """A clip whose loop/marker setters reject start >= end, like Live."""
 
+    # Writes Live applies on the next tick.
+    PENDING = ("muted", "color")
+
     def __init__(self, name="Clip", length=4.0, start_time=0.0, notes=None,
-                 is_midi_clip=True):
+                 is_midi_clip=True, span=None):
+        self._pending = {}
+        self._span = span
         self.name = name
         self.length = length
         self.start_time = start_time
@@ -101,16 +110,26 @@ class FakeClip(object):
         self.pitch_fine = 0.0
         self.warping = True
         self.warp_mode = 0
+        self.settle()
         self.set_log = []
 
     def __setattr__(self, key, value):
-        object.__setattr__(self, key, value)
+        if key in self.PENDING:
+            self._pending[key] = value
+        else:
+            object.__setattr__(self, key, value)
         if not key.startswith("_") and key != "set_log" and hasattr(self, "set_log"):
             self.set_log.append(key)
 
+    def settle(self):
+        for key, value in self._pending.items():
+            object.__setattr__(self, key, value)
+        self._pending.clear()
+
     @property
     def end_time(self):
-        return self.start_time + self.length
+        """Timeline end; a looped clip can span more than its loop length."""
+        return self.start_time + (self._span if self._span is not None else self.length)
 
     def _pair(self, low, high):
         if low >= high:
@@ -210,6 +229,8 @@ class FakeTrack(object):
         if self.duplicate_fails:
             raise RuntimeError("duplicate failed")
         copy = FakeClip(clip.name, clip.length, time, list(clip.notes))
+        # Live 11 moves the playhead to the duplicated clip.
+        self.song.current_song_time = time
         return self.add_arrangement_clip(copy)
 
     def delete_clip(self, clip):
@@ -248,8 +269,14 @@ class FakeCue(object):
 
 
 class FakeSong(object):
+    # Writes Live applies on the next tick.
+    PENDING = ("current_song_time", "loop", "loop_start", "loop_length")
+
     def __init__(self, tracks=None):
+        object.__setattr__(self, "_pending", {})
         self.tracks = tracks if tracks is not None else [FakeTrack("Midi")]
+        for track in self.tracks:
+            track.song = self
         self.cue_points = []
         self.current_song_time = 0.0
         self.song_length = 64.0
@@ -260,17 +287,46 @@ class FakeSong(object):
         self.signature_numerator = 4
         self.signature_denominator = 4
         self.undo_steps = []
+        self.events = []
         self.cue_select_fails = False
+        self.playhead_stuck = False
+        self.toggle_ignored = False
+        self.settle()
+
+    def __setattr__(self, key, value):
+        if key in self.PENDING:
+            if not (key == "current_song_time" and getattr(self, "playhead_stuck", False)):
+                self._pending[key] = value
+        else:
+            object.__setattr__(self, key, value)
+
+    def settle(self):
+        """Apply pending writes, as Live does on its next tick."""
+        for key, value in self._pending.items():
+            object.__setattr__(self, key, value)
+        self._pending.clear()
+        for track in self.tracks:
+            clips = [slot.clip for slot in track.clip_slots if slot.clip is not None]
+            clips.extend(track._arrangement)
+            for clip in clips:
+                clip.settle()
+
+    def tick(self):
+        self.events.append("tick")
+        self.settle()
 
     def begin_undo_step(self):
         self.undo_steps.append("begin")
+        self.events.append("begin")
 
     def end_undo_step(self):
         self.undo_steps.append("end")
+        self.events.append("end")
 
     def add_cue(self, name, time):
         self.cue_points.append(FakeCue(self, name, time))
 
+    # Cue operations use the applied playhead, not a pending write.
     def _cue_here(self):
         for cue in self.cue_points:
             if cue.time == self.current_song_time:
@@ -281,6 +337,9 @@ class FakeSong(object):
         return not self.cue_select_fails and self._cue_here() is not None
 
     def set_or_delete_cue(self):
+        self.events.append("toggle")
+        if self.toggle_ignored:
+            return
         cue = self._cue_here()
         if cue is not None:
             self.cue_points.remove(cue)
@@ -306,7 +365,13 @@ def make_instance(script, song):
     inst._song = song
     inst.log_message = lambda *a, **k: None
     inst.show_message = lambda *a, **k: None
-    inst.schedule_message = lambda _delay, task: task()
+
+    def schedule_message(delay, task):
+        if delay >= 1:
+            song.tick()
+        task()
+
+    inst.schedule_message = schedule_message
     return inst
 
 
@@ -362,6 +427,7 @@ def test_get_arrangement_info(script):
     song.add_cue("Chorus", 16.0)
     song.add_cue("Intro", 0.0)
     song.loop = True
+    song.settle()
 
     info = ok(run(make_instance(script, song), "get_arrangement_info"))
     assert info["loop"] == {"enabled": True, "start": 0.0, "length": 16.0}
@@ -374,7 +440,7 @@ def test_get_arrangement_info(script):
     assert keys["is_midi_track"] and not keys["is_audio_track"]
     assert [c["name"] for c in keys["clips"]] == ["A", "B"]
     assert keys["clips"][0] == {"index": 0, "name": "A", "start_time": 0.0,
-                                "end_time": 2.0, "length": 2.0,
+                                "end_time": 2.0, "length": 2.0, "loop_length": 2.0,
                                 "is_midi_clip": True, "muted": True}
     assert info["tracks"][1]["is_audio_track"]
     assert info["tracks"][2]["is_group_track"]
@@ -391,6 +457,7 @@ def _cue_song():
     song.add_cue("Intro", 0.0)
     song.add_cue("verse", 24.0)
     song.current_song_time = 4.0
+    song.settle()
     return song
 
 
@@ -443,6 +510,8 @@ def test_cue_delete_when_cue_cannot_be_selected(script):
     assert error_code(response) == "internal_error"
     assert "could not select cue" in response["message"]
     assert len(song.cue_points) == 3
+    assert "toggle" not in song.events
+    song.settle()
     assert song.current_song_time == 4.0
 
 
@@ -859,3 +928,180 @@ def test_view_arrangement_on_group_track(script):
     response = run(make_instance(script, song), "get_clip_notes", track_index=0,
                    clip_index=0, view="arrangement")
     assert error_code(response) == "clip_index_out_of_range"
+
+
+# --------------------------------------------------------------------------
+# Multi-tick commands: Live applies writes on the next tick
+# --------------------------------------------------------------------------
+
+def _one_undo_step_around_ticks(song):
+    """One begin/end pair, opened before the first tick and closed after the last."""
+    assert song.undo_steps == ["begin", "end"]
+    assert song.events[0] == "begin"
+    assert song.events[-1] == "end"
+    assert "tick" in song.events
+
+
+def test_create_locator_toggles_at_the_target_not_the_old_playhead(script):
+    song = FakeSong()
+    song.current_song_time = 32.0
+    song.settle()
+    result = ok(run(make_instance(script, song), "create_locator", name="Intro", time=0.0))
+    assert result == {"success": True, "time": 0.0, "name": "Intro"}
+    assert [(c.name, c.time) for c in song.cue_points] == [("Intro", 0.0)]
+    assert song.current_song_time == 32.0
+    assert song.events.count("toggle") == 1
+    _one_undo_step_around_ticks(song)
+
+
+def test_create_locator_renames_an_existing_cue_without_toggling(script):
+    song = _cue_song()
+    result = ok(run(make_instance(script, song), "create_locator", name="Drop", time=8.0))
+    assert result["name"] == "Drop"
+    assert len(song.cue_points) == 3
+    assert "toggle" not in song.events
+    assert song.current_song_time == 4.0
+
+
+def test_create_locator_reports_a_cue_that_never_appears(script):
+    song = FakeSong()
+    song.current_song_time = 32.0
+    song.settle()
+    song.toggle_ignored = True
+    response = run(make_instance(script, song), "create_locator", name="X", time=16.0)
+    assert error_code(response) == "internal_error"
+    assert "Failed to create cue at time 16.0" in response["message"]
+    song.settle()
+    assert song.current_song_time == 32.0
+    assert song.undo_steps == ["begin", "end"]
+
+
+def test_create_locator_never_toggles_when_the_playhead_does_not_move(script):
+    song = FakeSong()
+    song.current_song_time = 32.0
+    song.settle()
+    song.playhead_stuck = True
+    response = run(make_instance(script, song), "create_locator", name="X", time=0.0)
+    assert error_code(response) == "timeout"
+    assert "toggle" not in song.events
+    assert song.cue_points == []
+
+
+def test_cue_delete_removes_only_the_target_and_spans_one_undo_step(script):
+    song = _cue_song()
+    song.add_cue("Outro", 462.0)
+    song.current_song_time = 462.0
+    song.settle()
+    result = ok(run(make_instance(script, song), "cue_point", action="delete", name="Intro"))
+    assert result["cue"] == {"name": "Intro", "time": 0.0}
+    assert sorted(c.time for c in song.cue_points) == [8.0, 24.0, 462.0]
+    assert song.events.count("toggle") == 1
+    assert song.current_song_time == 462.0
+    assert result["current_song_time"] == 462.0
+    _one_undo_step_around_ticks(song)
+
+
+def test_cue_delete_never_toggles_when_the_playhead_does_not_move(script):
+    song = _cue_song()
+    song.playhead_stuck = True
+    response = run(make_instance(script, song), "cue_point", action="delete", name="Verse")
+    assert response["status"] == "error"
+    assert "toggle" not in song.events
+    assert sorted(c.time for c in song.cue_points) == [0.0, 8.0, 24.0]
+
+
+def test_cue_next_reports_where_live_landed(script):
+    song = _cue_song()
+    song.add_cue("Outro", 462.0)
+    song.current_song_time = 32.0
+    song.settle()
+    result = ok(run(make_instance(script, song), "cue_point", action="next"))
+    assert result["cue"] == {"name": "Outro", "time": 462.0}
+    assert result["current_song_time"] == 462.0
+    assert song.undo_steps == []
+
+
+def test_cue_jump_waits_for_the_playhead(script):
+    song = _cue_song()
+    result = ok(run(make_instance(script, song), "cue_point", action="jump", name="verse"))
+    assert result["current_song_time"] == 8.0
+
+
+def test_set_arrangement_loop_reads_back_the_applied_values(script):
+    song = FakeSong()
+    result = ok(run(make_instance(script, song), "set_arrangement_loop",
+                    enabled=True, start=16.0, length=8.0))
+    assert result == {"enabled": True, "start": 16.0, "length": 8.0}
+    _one_undo_step_around_ticks(song)
+
+
+def test_midi_clip_fallback_restores_the_playhead(script):
+    song = FakeSong([FakeTrack("Keys")])
+    song.current_song_time = 2.0
+    song.settle()
+    result = ok(run(make_instance(script, song), "create_arrangement_midi_clip",
+                    track_index=0, start=16.0, length=4.0, notes=NOTES))
+    assert result["method"] == "session_fallback"
+    assert song.current_song_time == 2.0
+    _one_undo_step_around_ticks(song)
+
+
+def test_set_clip_properties_reads_back_after_live_applies(script):
+    clip = FakeClip("C", 4.0)
+    song = _song_with_session_clip(clip)
+    result = ok(run(make_instance(script, song), "set_clip_properties",
+                    track_index=0, clip_index=0,
+                    properties={"muted": True, "color": 1234}))
+    assert result["properties"] == {"muted": True, "color": 1234}
+    _one_undo_step_around_ticks(song)
+
+
+def test_arrangement_info_length_is_the_timeline_length(script):
+    track = FakeTrack("Keys")
+    track.add_arrangement_clip(FakeClip("Looped", 4.0, 16.0, span=8.0))
+    info = ok(run(make_instance(script, FakeSong([track])), "get_arrangement_info"))
+    clip = info["tracks"][0]["clips"][0]
+    assert (clip["start_time"], clip["end_time"]) == (16.0, 24.0)
+    assert clip["length"] == 8.0
+    assert clip["loop_length"] == 4.0
+
+
+def test_a_wait_that_never_succeeds_is_a_timeout(script):
+    song = FakeSong()
+    inst = make_instance(script, song)
+    outcome = inst._run_on_main_thread(
+        "set_arrangement_loop", lambda: inst._wait_for(lambda: False, max_ticks=3))
+    assert outcome["status"] == "error"
+    assert outcome["code"] == "timeout"
+    assert song.events.count("tick") == 3
+    # The undo step still closes when the command fails mid-way.
+    assert song.undo_steps == ["begin", "end"]
+
+
+def test_a_wait_can_report_failure_instead_of_raising(script):
+    inst = make_instance(script, FakeSong())
+
+    def handler():
+        done = yield from inst._wait_for(lambda: False, max_ticks=2, raise_on_timeout=False)
+        return {"done": done}
+
+    assert inst._run_on_main_thread("cue_point", handler) == {
+        "status": "success", "result": {"done": False}}
+
+
+def test_generator_results_are_the_return_value(script):
+    inst = make_instance(script, FakeSong())
+
+    def handler():
+        yield
+        yield
+        return {"answer": 42}
+
+    assert inst._run_on_main_thread("cue_point", handler) == {
+        "status": "success", "result": {"answer": 42}}
+
+
+def test_plain_commands_run_in_one_tick(script):
+    song = _arrangement_song()
+    ok(run(make_instance(script, song), "delete_clip", track_index=0, clip_index=0))
+    assert song.events == ["begin", "end"]

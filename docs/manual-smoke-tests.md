@@ -9,7 +9,7 @@ to the Remote Script.
 1. Run `ableton-mcp-install-script`, then restart Live.
 2. Open a fresh, empty Live set.
 3. Start the MCP server and call `get_remote_script_info`. Confirm it reports
-   script version 1.10.0 and `up_to_date: true`. Confirm `live_version` shows
+   script version 1.10.1 and `up_to_date: true`. Confirm `live_version` shows
    your Live build and `live_api` lists the version-dependent APIs (on Live 11
    expect `track_create_midi_clip: false`, `song_begin_undo_step: true`,
    `automation_envelope_insert_step: true`).
@@ -63,18 +63,22 @@ to the Remote Script.
    inside the reported range. Then try a value above `max` and confirm a
    `parameter_value_out_of_range` error with the parameter unchanged.
 
-## Arrangement (1.10.0)
+## Arrangement (1.10.1)
 
 Start with at least one MIDI track (with an instrument and one empty Session
-slot) and one audio track.
+slot) and one audio track. Clear leftovers from earlier runs first: stray
+locators, the loop, test clips. Live restarts to load a new Remote Script, so
+rebuild the test tracks after each update.
 
 1. Call `get_arrangement_info`. Confirm song length, loop, time signature,
    cue points and each track's arrangement clips, with bar numbers that match
-   Live's ruler.
+   Live's ruler. A clip's `length` is its span on the timeline; `loop_length`
+   is Live's loop length (they differ for a looped clip).
 2. Call `create_arrangement_midi_clip` on the MIDI track with `start_bar=5`,
    `length_bars=2` and a few notes (use note names). Confirm the clip appears
    at bar 5, two bars long, with the notes, and that the temporary Session clip
-   is gone. On Live 11 the result says `"method": "session_fallback"`.
+   is gone. On Live 11 the result ends with `(method: session_fallback)`.
+   The playhead must be back where it was before the call.
 3. Call it again overlapping that clip: expect `clip_overlap`. Call `undo`
    once and confirm the whole first clip disappears in one step (no leftover
    Session clip).
@@ -88,11 +92,17 @@ slot) and one audio track.
 6. Call `create_arrangement_audio_clip` on the audio track with a real `.wav`
    at `start_bar=9`. Confirm the clip lands at bar 9. Try a missing file:
    `invalid_audio_file`.
-7. Create two locators (`create_locator`), then `cue_point` with `jump` by
-   name, `next`, `previous`, and `delete` by name. Confirm the playhead moves,
-   jumps add no undo steps, and the deleted locator is gone (undo restores it).
+7. Park the playhead somewhere else (e.g. bar 20), then create two locators
+   with `create_locator` at bar 1 (time 0) and bar 5 (time 16). Both must land
+   at those times with those names — not at the playhead — and the playhead
+   must return to bar 20. Then `cue_point` with `jump` by name, `next`,
+   `previous` (each reports the cue it actually landed on), and `delete` by
+   name: only that locator disappears, no new one appears, jumps add no undo
+   steps, and one `undo` restores the deleted locator. (Before 1.10.1 these
+   acted at the old playhead position.)
 8. Call `set_arrangement_loop` with `start_bar=5`, `length_bars=4`,
-   `enabled=true`; confirm the loop brace.
+   `enabled=true`; confirm the loop brace and that the reply says the loop is
+   on.
 9. Call `delete_clip` with `view="arrangement"` on the audio clip; confirm it
    is removed from the Arrangement only.
 
@@ -121,7 +131,8 @@ slot) and one audio track.
    took 6.4 s and 31 KB; the log line "Received complete response" gives the
    size, and its timestamp against "Sending command" gives the duration.
 2. `max_depth` is capped at 2: depth 3 took 9.8 s and 634 KB, against a 10 s
-   read timeout.
+   read timeout. Asking for 3 returns the depth-2 tree with a "max_depth
+   capped at 2" line.
 
 ## Live API dump (developer)
 

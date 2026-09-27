@@ -507,8 +507,17 @@ def _time_signature_for(*bar_args) -> tuple[int, int]:
 
 
 def _bar_or_none(beat, numerator: int, denominator: int):
+    """Bar position (bar 1 = beat 0) of a beat position, or None."""
     try:
         return round(timing.beat_to_bar(float(beat), numerator, denominator), 6)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bars_or_none(beats, numerator: int, denominator: int):
+    """A duration in beats expressed in bars (4 beats = 1 bar in 4/4), or None."""
+    try:
+        return round(float(beats) / timing.beats_per_bar(numerator, denominator), 6)
     except (TypeError, ValueError):
         return None
 
@@ -1730,6 +1739,9 @@ def set_scene_name(ctx: Context, scene_index: int, name: str, user_prompt: str =
         logger.error(f"Error setting scene name: {str(e)}")
         return f"Error setting scene name: {str(e)}"
 
+_BROWSER_MAX_DEPTH = 2
+
+
 @mcp.tool()
 @rich_telemetry_tool("get_browser_tree")
 @trajectory_tool("get_browser_tree")
@@ -1751,21 +1763,28 @@ def get_browser_tree(
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
+        # The Remote Script caps the walk at 2; clamp here so the output says so.
+        depth = min(max(int(max_depth), 0), _BROWSER_MAX_DEPTH)
+        capped_note = (
+            f"max_depth capped at {_BROWSER_MAX_DEPTH} (deeper walks exceed the "
+            "read timeout; use get_browser_items_at_path)\n"
+            if max_depth > _BROWSER_MAX_DEPTH else ""
+        )
         ableton = get_ableton_connection()
         result = ableton.send_command("get_browser_tree", {
             "category_type": category_type,
-            "max_depth": max_depth,
+            "max_depth": depth,
         })
         
         # Check if we got any categories
         if "available_categories" in result and len(result.get("categories", [])) == 0:
             available_cats = result.get("available_categories", [])
-            return (f"No categories found for '{category_type}'. "
+            return (f"{capped_note}No categories found for '{category_type}'. "
                    f"Available browser categories: {', '.join(available_cats)}")
         
         # Format the tree in a more readable way
         total_folders = result.get("total_folders", 0)
-        formatted_output = f"Browser tree for '{category_type}' (showing {total_folders} folders):\n\n"
+        formatted_output = f"{capped_note}Browser tree for '{category_type}' (showing {total_folders} folders):\n\n"
         
         def format_tree(item, indent=0):
             output = ""
@@ -2064,7 +2083,9 @@ def get_arrangement_info(ctx: Context, user_prompt: str = "") -> str:
     Returns song length, playhead (current_song_time / current_bar), loop
     (enabled, start, length), tempo, time signature, cue points (index, name,
     time, bar; sorted by time) and, for every track, its arrangement clips
-    (index, name, start_time/end_time in beats, start_bar/end_bar, length,
+    (index, name, start_time/end_time in beats, start_bar/end_bar, length =
+    beats the clip occupies on the timeline, loop_length = the clip's own loop
+    in beats, each also in bars as length_bars / loop_length_bars,
     is_midi_clip, muted). Clip indexes are the ones to pass as clip_index with
     view="arrangement". Bars follow Live's ruler (bar 1 = beat 0) and use the
     current time signature.
@@ -2090,6 +2111,10 @@ def get_arrangement_info(ctx: Context, user_prompt: str = "") -> str:
             for clip in track.get("clips") or []:
                 clip["start_bar"] = _bar_or_none(clip.get("start_time"), num, den)
                 clip["end_bar"] = _bar_or_none(clip.get("end_time"), num, den)
+                if "length" in clip:
+                    clip["length_bars"] = _bars_or_none(clip["length"], num, den)
+                if "loop_length" in clip:
+                    clip["loop_length_bars"] = _bars_or_none(clip["loop_length"], num, den)
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error getting arrangement info: {str(e)}")
@@ -2250,7 +2275,7 @@ def create_arrangement_midi_clip(
         if missing:
             return missing
         method = result.get("method")
-        via = " (via temporary Session clip)" if method == "session_fallback" else ""
+        via = f" (method: {method})" if method else ""
         return (
             f"Created arrangement MIDI clip '{result.get('name', name or 'clip')}' on track "
             f"{track_index}, beats {result.get('start_time', start)}-"

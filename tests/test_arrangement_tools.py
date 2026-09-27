@@ -103,7 +103,8 @@ ARRANGEMENT_INFO = {
         {"index": 0, "name": "Bass", "is_midi_track": True, "is_audio_track": False,
          "is_group_track": False,
          "clips": [{"index": 0, "name": "A", "start_time": 3.0, "end_time": 7.5,
-                    "length": 4.5, "is_midi_clip": True, "muted": False}]},
+                    "length": 4.5, "loop_length": 1.5, "is_midi_clip": True,
+                    "muted": False}]},
         {"index": 1, "name": "Group", "is_midi_track": False, "is_audio_track": False,
          "is_group_track": True, "clips": []},
     ],
@@ -118,6 +119,9 @@ def test_get_arrangement_info_adds_bars(fake_conn):
     assert [c["bar"] for c in out["cue_points"]] == [1.0, 5.0]
     clip = out["tracks"][0]["clips"][0]
     assert (clip["start_bar"], clip["end_bar"]) == (2.0, 3.5)
+    # Durations convert without the +1 bar offset of positions
+    assert (clip["length_bars"], clip["loop_length_bars"]) == (1.5, 0.5)
+    assert (clip["length"], clip["loop_length"]) == (4.5, 1.5)
     assert out["tracks"][1]["clips"] == []
     assert out["tempo"] == 120.0
 
@@ -130,6 +134,16 @@ def test_get_arrangement_info_6_8(fake_conn):
     # 6/8 bar = 3 beats
     assert out["current_bar"] == 3.0
     assert out["tracks"][0]["clips"][0]["end_bar"] == 3.5
+    assert out["tracks"][0]["clips"][0]["length_bars"] == 1.5
+
+
+def test_get_arrangement_info_without_loop_length(fake_conn):
+    info = json.loads(json.dumps(ARRANGEMENT_INFO))
+    del info["tracks"][0]["clips"][0]["loop_length"]
+    fake_conn({"get_arrangement_info": info})
+    clip = json.loads(call(server.get_arrangement_info, None))["tracks"][0]["clips"][0]
+    assert "loop_length_bars" not in clip
+    assert clip["length_bars"] == 1.5
 
 
 def test_get_arrangement_info_missing_capability(fake_conn, without_capability):
@@ -239,7 +253,16 @@ def test_create_arrangement_midi_clip_beats(fake_conn):
     assert [n["pitch"] for n in params["notes"]] == [60, 64]
     assert params["name"] == "Riff"
     assert params["allow_overlap"] is False
-    assert "index 2" in out and "temporary Session clip" in out
+    assert "index 2" in out
+    assert out.endswith("(method: session_fallback)")
+
+
+def test_create_arrangement_midi_clip_reports_native_method(fake_conn):
+    fake_conn({"create_arrangement_midi_clip": {
+        "clip_index": 0, "name": "X", "start_time": 0.0, "end_time": 4.0,
+        "note_count": 0, "method": "create_midi_clip"}})
+    out = call(server.create_arrangement_midi_clip, None, 0, start=0.0, length=4.0)
+    assert out.endswith("(method: create_midi_clip)")
 
 
 def test_create_arrangement_midi_clip_bars_in_3_4(fake_conn):
@@ -459,3 +482,32 @@ def test_tools_registered():
     for name in ["get_clip_notes", "add_notes_to_clip", "modify_clip_notes",
                  "remove_notes_from_clip", "clear_notes_from_clip", "delete_clip"]:
         assert "view" in by_name[name].inputSchema["properties"]
+
+
+# --------------------------------------------------------------------------
+# Outputs report what Live read back, not what was asked
+# --------------------------------------------------------------------------
+
+def test_create_locator_reports_returned_name_and_time(fake_conn):
+    fake_conn({"create_locator": {"name": "Chorus", "time": 16.0}})
+    out = call(server.create_locator, None, "chorus", 15.9999)
+    assert out == "Locator 'Chorus' set at beat 16.0"
+
+
+def test_set_arrangement_loop_reports_read_back(fake_conn):
+    fake_conn({"set_arrangement_loop": {"enabled": True, "start": 4.0, "length": 12.0}})
+    out = call(server.set_arrangement_loop, None, True, start=4.0, length=8.0)
+    assert out == "Arrangement loop on: start beat 4.0, length 12.0 beats"
+
+
+def test_cue_point_jump_reports_returned_cue(fake_conn):
+    fake_conn({"cue_point": {"action": "jump", "cue": {"name": "Drop", "time": 32.0},
+                             "current_song_time": 32.0}})
+    out = call(server.cue_point, None, "jump", time=30.0)
+    assert out == "Jumped to cue 'Drop' at beat 32.0"
+
+
+def test_set_clip_properties_reports_read_back(fake_conn):
+    fake_conn({"set_clip_properties": {"properties": {"loop_end": 8.0}}})
+    out = call(server.set_clip_properties, None, 0, 0, {"loop_end": 7.99})
+    assert out.endswith('{"loop_end": 8.0}')

@@ -211,6 +211,17 @@ def test_undo_reports_when_there_is_nothing_to_undo(fake_conn):
     assert call(server.undo, None) == "Nothing to undo"
 
 
+@pytest.mark.parametrize("asked, sent", [(-3, 0), (0, 0), (1, 1), (2, 2), (3, 2), (10, 2)])
+def test_get_browser_tree_clamps_max_depth(fake_conn, asked, sent):
+    conn = fake_conn(response={"categories": [{"name": "Instruments"}], "total_folders": 1})
+    out = call(server.get_browser_tree, None, "instruments", asked)
+    assert conn.sent[0][1]["max_depth"] == sent
+    note = ("max_depth capped at 2 (deeper walks exceed the read timeout; "
+            "use get_browser_items_at_path)")
+    assert (note in out) == (asked > 2)
+    assert "Instruments" in out
+
+
 def test_get_browser_tree_forwards_max_depth(fake_conn):
     conn = fake_conn(response={"categories": [], "total_folders": 0})
     call(server.get_browser_tree, None, "instruments", 2)
