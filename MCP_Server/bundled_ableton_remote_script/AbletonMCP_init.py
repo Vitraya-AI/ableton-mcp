@@ -2,6 +2,7 @@
 from __future__ import absolute_import, print_function, unicode_literals
 
 from _Framework.ControlSurface import ControlSurface
+import inspect
 import os
 import socket
 import json
@@ -34,7 +35,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.8.1"
+SCRIPT_VERSION = "1.11.1"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -76,6 +77,27 @@ SCRIPT_CAPABILITIES = [
     "fire_scene",
     "delete_scene",
     "set_scene_name",
+    "dump_live_api",
+    "get_arrangement_info",
+    "cue_point",
+    "set_arrangement_loop",
+    "create_arrangement_midi_clip",
+    "create_arrangement_audio_clip",
+    "set_clip_properties",
+    # Flag, not a command: the note tools and delete_clip understand
+    # view="arrangement". Older scripts would ignore it and act on a Session
+    # clip, so the server refuses the view without this.
+    "clip_view_param",
+    "get_rack_info",
+    "set_device_enabled",
+    "delete_device",
+    "navigate_device_preset",
+    # Flags, not commands: device commands understand chain_index /
+    # chain_device_index, and set_device_parameter understands parameter_name.
+    # An older script would ignore them and act on the outer device or the
+    # wrong parameter, so the server refuses them without these.
+    "device_chain_param",
+    "parameter_name_param",
     "error_codes",
 ]
 
@@ -103,6 +125,8 @@ _ERROR_CODE_PATTERNS = (
     ("path part", "browser_path_not_found"),
     ("unknown or unavailable category", "browser_path_not_found"),
     ("not loadable", "not_loadable"),
+    # Live's own wording when ClipSlot/Track.create_audio_clip rejects a file.
+    ("valid audio file", "invalid_audio_file"),
     ("unknown command", "unknown_command"),
     ("timeout waiting", "timeout"),
 )
@@ -330,7 +354,10 @@ class AbletonMCP(ControlSurface):
     
     # create_audio_clip decodes/imports the file on the main thread and needs
     # more than the default headroom.
-    _MAIN_THREAD_TIMEOUTS = {"create_audio_clip": 60.0}
+    _MAIN_THREAD_TIMEOUTS = {
+        "create_audio_clip": 60.0,
+        "create_arrangement_audio_clip": 60.0,
+    }
 
     # Commands that edit the set. Each runs as its own undo step: without the
     # boundary Live can merge back-to-back script edits, so creating then
@@ -348,6 +375,9 @@ class AbletonMCP(ControlSurface):
         "set_device_parameter", "create_scene", "delete_scene", "set_scene_name",
         "load_instrument_or_effect", "load_browser_item",
         "duplicate_session_clip_to_arrangement", "create_locator", "map_rack_magnitude",
+        "set_arrangement_loop", "create_arrangement_midi_clip",
+        "create_arrangement_audio_clip", "set_clip_properties",
+        "set_device_enabled", "delete_device",
     ])
 
     def _read_handlers(self, params):
@@ -362,13 +392,20 @@ class AbletonMCP(ControlSurface):
                 p("category_type", "all"), p("max_depth", 1)),
             "get_browser_items_at_path": lambda: self.get_browser_items_at_path(p("path", "")),
             "get_arrangement_clips": lambda: self._get_arrangement_clips(p("track_index", 0)),
-            "get_clip_notes": lambda: self._get_clip_notes(p("track_index", 0), p("clip_index", 0)),
+            "get_clip_notes": lambda: self._get_clip_notes(
+                p("track_index", 0), p("clip_index", 0), p("view", None)),
+            "get_arrangement_info": lambda: self._get_arrangement_info(),
             "get_device_parameters": lambda: self._get_device_parameters(
-                p("track_index", 0), p("device_index", 0)),
+                p("track_index", 0), p("device_index", 0),
+                p("chain_index", None), p("chain_device_index", None)),
+            "get_rack_info": lambda: self._get_rack_info(
+                p("track_index", 0), p("device_index", 0),
+                p("chain_index", None), p("chain_device_index", None)),
             "get_session_snapshot": lambda: self._get_session_snapshot(
                 include_notes=p("include_notes", True),
                 include_params=p("include_params", True)),
             "drain_passive_events": lambda: self._drain_passive_events(),
+            "dump_live_api": lambda: self._dump_live_api(p("module", None)),
         }
 
     def _main_thread_handlers(self, params):
@@ -384,22 +421,23 @@ class AbletonMCP(ControlSurface):
             "create_audio_clip": lambda: self._create_audio_clip(
                 p("track_index", 0), p("clip_index", 0), p("path", "")),
             "add_notes_to_clip": lambda: self._add_notes_to_clip(
-                p("track_index", 0), p("clip_index", 0), p("notes", [])),
+                p("track_index", 0), p("clip_index", 0), p("notes", []), p("view", None)),
             "modify_clip_notes": lambda: self._modify_clip_notes(
-                p("track_index", 0), p("clip_index", 0), p("notes", [])),
+                p("track_index", 0), p("clip_index", 0), p("notes", []), p("view", None)),
             "remove_notes_from_clip": lambda: self._remove_notes_from_clip(
                 p("track_index", 0), p("clip_index", 0),
                 p("from_time", 0.0), p("time_span", -1.0),
-                p("from_pitch", 0), p("pitch_span", 128)),
+                p("from_pitch", 0), p("pitch_span", 128), p("view", None)),
             "clear_notes_from_clip": lambda: self._clear_notes_from_clip(
-                p("track_index", 0), p("clip_index", 0)),
+                p("track_index", 0), p("clip_index", 0), p("view", None)),
             "set_clip_name": lambda: self._set_clip_name(
                 p("track_index", 0), p("clip_index", 0), p("name", "")),
             "set_arrangement_clip_name": lambda: self._set_arrangement_clip_name(
                 p("track_index", 0), p("clip_index", 0), p("name", "")),
             "duplicate_clip": lambda: self._duplicate_clip(
                 p("track_index", 0), p("source_clip_index", 0), p("dest_clip_index", 0)),
-            "delete_clip": lambda: self._delete_clip(p("track_index", 0), p("clip_index", 0)),
+            "delete_clip": lambda: self._delete_clip(
+                p("track_index", 0), p("clip_index", 0), p("view", None)),
             "fire_clip": lambda: self._fire_clip(p("track_index", 0), p("clip_index", 0)),
             "stop_clip": lambda: self._stop_clip(p("track_index", 0), p("clip_index", 0)),
             "set_tempo": lambda: self._set_tempo(p("tempo", 120.0)),
@@ -420,7 +458,18 @@ class AbletonMCP(ControlSurface):
             "set_master_panning": lambda: self._set_master_panning(p("value", 0.0)),
             "set_device_parameter": lambda: self._set_device_parameter(
                 p("track_index", 0), p("device_index", 0),
-                p("parameter_index", 0), p("value", 0.0)),
+                p("parameter_index", None), p("value", 0.0),
+                p("parameter_name", None),
+                p("chain_index", None), p("chain_device_index", None)),
+            "set_device_enabled": lambda: self._set_device_enabled(
+                p("track_index", 0), p("device_index", 0), p("enabled", True),
+                p("chain_index", None), p("chain_device_index", None)),
+            "delete_device": lambda: self._delete_device(
+                p("track_index", 0), p("device_index", 0),
+                p("chain_index", None), p("chain_device_index", None)),
+            "navigate_device_preset": lambda: self._navigate_device_preset(
+                p("track_index", 0), p("device_index", 0), p("direction", None),
+                p("chain_index", None), p("chain_device_index", None)),
             "create_scene": lambda: self._create_scene(p("index", -1)),
             "fire_scene": lambda: self._fire_scene(p("scene_index", 0)),
             "delete_scene": lambda: self._delete_scene(p("scene_index", 0)),
@@ -435,6 +484,16 @@ class AbletonMCP(ControlSurface):
             "duplicate_session_clip_to_arrangement": lambda: self._duplicate_session_clip_to_arrangement(
                 p("track_index", 0), p("clip_index", 0), p("destination_time", 0.0)),
             "create_locator": lambda: self._create_locator(p("name", ""), p("time", 0.0)),
+            "cue_point": lambda: self._cue_point(p("action", None), p("name", None), p("time", None)),
+            "set_arrangement_loop": lambda: self._set_arrangement_loop(
+                p("enabled", None), p("start", None), p("length", None)),
+            "create_arrangement_midi_clip": lambda: self._create_arrangement_midi_clip(
+                p("track_index", 0), p("start", 0.0), p("length", 4.0), p("notes", None),
+                p("name", None), p("allow_overlap", False)),
+            "create_arrangement_audio_clip": lambda: self._create_arrangement_audio_clip(
+                p("track_index", 0), p("path", ""), p("start", 0.0), p("allow_overlap", False)),
+            "set_clip_properties": lambda: self._set_clip_properties(
+                p("track_index", 0), p("clip_index", 0), p("view", None), p("properties", None)),
             # Racks
             "map_rack_magnitude": lambda: self._map_rack_magnitude(
                 p("track_index", 0), p("device_index", 0), p("macro_name", "Magnitude")),
@@ -442,36 +501,107 @@ class AbletonMCP(ControlSurface):
         }
 
     def _in_undo_step(self, handler):
-        """Run handler as one undo step, where this Live supports marking them."""
+        """Run handler as one undo step, where this Live supports marking them.
+
+        A handler that returns a generator (a multi-tick command) keeps the
+        undo step open until the generator finishes or raises, so the step
+        spans every tick rather than just the first.
+        """
         begin = getattr(self._song, "begin_undo_step", None)
         end = getattr(self._song, "end_undo_step", None)
         if begin is None or end is None:
             return handler()
         begin()
         try:
-            return handler()
+            result = handler()
+        except Exception:
+            end()
+            raise
+        if not inspect.isgenerator(result):
+            end()
+            return result
+        return self._end_undo_step_after(result, end)
+
+    @staticmethod
+    def _end_undo_step_after(steps, end):
+        try:
+            result = yield from steps
         finally:
             end()
+        return result
+
+    def _wait_for(self, predicate, max_ticks=10, raise_on_timeout=True):
+        """Generator: yield one Live tick at a time until predicate() is true.
+
+        Live applies some writes (the playhead, loop settings) only on its
+        next tick, so reading back or acting on them in the same tick sees
+        the old state. Use as ``ok = yield from self._wait_for(...)``.
+        Returns False on timeout unless raise_on_timeout.
+        """
+        for _tick in range(max_ticks):
+            if predicate():
+                return True
+            yield
+        if predicate():
+            return True
+        if raise_on_timeout:
+            raise CommandError("Live did not apply the change in time", "timeout")
+        return False
 
     def _run_on_main_thread(self, command_type, handler):
-        """Run handler on Live's main thread and wait for its outcome."""
+        """Run handler on Live's main thread and wait for its outcome.
+
+        A handler may return a generator to wait for Live between steps: each
+        yield resumes on the next tick (schedule_message(1, ...)) and the
+        generator's return value is the result. The queue timeout below
+        still bounds the whole command.
+        """
         response_queue = queue.Queue()
+        cancelled = []
         if command_type in self._UNDOABLE_COMMANDS:
             run = lambda: self._in_undo_step(handler)
         else:
             run = handler
 
+        def succeed(result):
+            response_queue.put({"status": "success", "result": result})
+
+        def fail(e):
+            self.log_message("Error in main thread task: " + str(e))
+            self.log_message(traceback.format_exc())
+            response_queue.put({
+                "status": "error",
+                "message": str(e),
+                "code": error_code_for(e),
+            })
+
+        def drive(steps):
+            def step():
+                if cancelled:
+                    # The caller already got a timeout; stop acting on Live.
+                    steps.close()
+                    return
+                try:
+                    next(steps)
+                except StopIteration as stop:
+                    succeed(stop.value)
+                    return
+                except Exception as e:
+                    fail(e)
+                    return
+                self.schedule_message(1, step)
+            step()
+
         def main_thread_task():
             try:
-                response_queue.put({"status": "success", "result": run()})
+                result = run()
             except Exception as e:
-                self.log_message("Error in main thread task: " + str(e))
-                self.log_message(traceback.format_exc())
-                response_queue.put({
-                    "status": "error",
-                    "message": str(e),
-                    "code": error_code_for(e),
-                })
+                fail(e)
+                return
+            if inspect.isgenerator(result):
+                drive(result)
+            else:
+                succeed(result)
 
         try:
             self.schedule_message(0, main_thread_task)
@@ -483,6 +613,7 @@ class AbletonMCP(ControlSurface):
         try:
             return response_queue.get(timeout=timeout)
         except queue.Empty:
+            cancelled.append(True)
             return {
                 "status": "error",
                 "message": "Timeout waiting for operation to complete",
@@ -539,7 +670,163 @@ class AbletonMCP(ControlSurface):
             "capabilities": list(SCRIPT_CAPABILITIES),
             "snapshot_schema": "ableton_mcp_snapshot_v2",
             "passive_listeners": True,
+            "live_version": self._live_version(),
+            "live_api": self._live_api_flags(),
         }
+
+    # flag -> (Live submodule, class, attribute). Checked on the class object,
+    # so the answer is about this Live build, not about any particular set.
+    _LIVE_API_FLAGS = (
+        ("track_create_midi_clip", ("Track", "Track", "create_midi_clip")),
+        ("track_create_audio_clip", ("Track", "Track", "create_audio_clip")),
+        ("clip_slot_create_audio_clip", ("ClipSlot", "ClipSlot", "create_audio_clip")),
+        ("song_begin_undo_step", ("Song", "Song", "begin_undo_step")),
+        ("clip_automation_envelope", ("Clip", "Clip", "automation_envelope")),
+        ("automation_envelope_insert_step", ("Clip", "AutomationEnvelope", "insert_step")),
+        # Live 12 moved insert_step to Live.Envelope; the module is absent on 11.
+        ("envelope_insert_step", ("Envelope", "Envelope", "insert_step")),
+        ("plugin_device_presets", ("PluginDevice", "PluginDevice", "presets")),
+    )
+
+    _LIVE_DOC_LIMIT = 2000
+
+    def _live_version(self):
+        """{"major", "minor", "bugfix", "string"} of the running Live, or None."""
+        try:
+            import Live
+            app = Live.Application.get_application()
+            major = int(app.get_major_version())
+            minor = int(app.get_minor_version())
+            bugfix = int(app.get_bugfix_version())
+        except Exception:
+            return None
+        return {
+            "major": major,
+            "minor": minor,
+            "bugfix": bugfix,
+            "string": "%d.%d.%d" % (major, minor, bugfix),
+        }
+
+    def _live_api_flags(self):
+        """Which version-dependent Live API calls this Live build has.
+
+        Empty when the Live module is unavailable (outside Live, in tests).
+        """
+        try:
+            import Live
+        except Exception:
+            return {}
+        flags = {}
+        for flag, (module_name, class_name, attr) in self._LIVE_API_FLAGS:
+            try:
+                klass = getattr(getattr(Live, module_name), class_name)
+                flags[flag] = bool(hasattr(klass, attr))
+            except Exception:
+                flags[flag] = False
+        # CuePoint.name is read-only on Live 11 ("Get/Listen") and settable on
+        # Live 12, so check for a setter rather than the attribute.
+        try:
+            prop = self._static_class_attr(Live.Song.CuePoint, "name")
+            flags["cue_point_set_name"] = getattr(prop, "fset", None) is not None
+        except Exception:
+            flags["cue_point_set_name"] = False
+        return flags
+
+    def _dump_live_api(self, module=None):
+        """Introspect the Live module for developer reference.
+
+        Without a module: the list of Live.* submodules. With one: every class
+        in it (nested ones keyed "Outer.Inner") with its members and
+        Boost.Python docstrings, which carry the call signatures.
+        """
+        try:
+            import Live
+        except Exception:
+            raise CommandError("Live module unavailable", "internal_error")
+
+        import inspect
+
+        if not module:
+            names = [name for name in dir(Live)
+                     if not name.startswith("_")
+                     and inspect.ismodule(getattr(Live, name, None))]
+            return {"live_version": self._live_version(), "modules": sorted(names)}
+
+        target = None
+        if not str(module).startswith("_"):
+            target = getattr(Live, str(module), None)
+        if not inspect.ismodule(target):
+            raise CommandError("Unknown Live module: %s" % module, "invalid_value")
+
+        classes = {}
+        seen = set()
+        for name in sorted(dir(target)):
+            if name.startswith("_"):
+                continue
+            value = getattr(target, name, None)
+            if inspect.isclass(value):
+                self._dump_live_class(name, value, classes, seen)
+        return {
+            "module": str(module),
+            "live_version": self._live_version(),
+            "classes": classes,
+        }
+
+    def _dump_live_class(self, qualified_name, klass, classes, seen):
+        """Record klass and, recursively, the classes nested in it."""
+        if id(klass) in seen:
+            return
+        seen.add(id(klass))
+        members = {}
+        nested = []
+        for name in sorted(dir(klass)):
+            if name.startswith("_") and name != "__init__":
+                continue
+            try:
+                value = self._static_class_attr(klass, name)
+            except Exception:
+                continue
+            kind = self._live_member_kind(value)
+            doc = None
+            if kind != "attribute":
+                doc = self._live_doc(value)
+            members[name] = {"kind": kind, "doc": doc}
+            if kind == "class":
+                nested.append((name, value))
+        classes[qualified_name] = {"doc": self._live_doc(klass), "members": members}
+        for name, value in nested:
+            self._dump_live_class(qualified_name + "." + name, value, classes, seen)
+
+    @staticmethod
+    def _static_class_attr(klass, name):
+        """klass.<name> without triggering descriptors, so a property shows
+        up as the property rather than whatever it computes on the class."""
+        for base in getattr(klass, "__mro__", (klass,)):
+            base_dict = getattr(base, "__dict__", {})
+            if name in base_dict:
+                return base_dict[name]
+        return getattr(klass, name)
+
+    @staticmethod
+    def _live_member_kind(value):
+        import inspect
+        if inspect.isclass(value):
+            return "class"
+        if isinstance(value, (staticmethod, classmethod)) or callable(value):
+            return "method"
+        if hasattr(value, "__get__") or hasattr(value, "__set__"):
+            return "property"
+        return "attribute"
+
+    def _live_doc(self, value):
+        doc = getattr(value, "__doc__", None)
+        if doc is None:
+            return None
+        try:
+            doc = str(doc)
+        except Exception:
+            return None
+        return doc[:self._LIVE_DOC_LIMIT]
     
     def _safe_song_property(self, attr, cast, default):
         """Read self._song.<attr> with cast, returning default on common failures.
@@ -749,16 +1036,19 @@ class AbletonMCP(ControlSurface):
     def _create_audio_clip(self, track_index, clip_index, path):
         """Create an audio clip in the specified audio track clip slot by importing a file.
 
-        Requires Ableton Live 12.0.5 or newer (the underlying
-        ClipSlot.create_audio_clip Live API was introduced in 12.0.5 — it is
-        not available in earlier 12.0.x releases).
+        Needs ClipSlot.create_audio_clip, which get_script_info reports as
+        live_api.clip_slot_create_audio_clip (present on Live 11.3.43).
         """
         try:
             if not path:
-                raise ValueError("Audio file path is required")
+                raise CommandError("Audio file path is required", "invalid_audio_file")
 
             if not os.path.isabs(path):
-                raise ValueError("Audio file path must be absolute (got: %s)" % path)
+                raise CommandError(
+                    "Audio file path must be absolute (got: %s)" % path, "invalid_audio_file")
+
+            if not os.path.isfile(path):
+                raise CommandError("Audio file not found: %s" % path, "invalid_audio_file")
 
             if track_index < 0 or track_index >= len(self._song.tracks):
                 raise IndexError("Track index out of range")
@@ -777,10 +1067,9 @@ class AbletonMCP(ControlSurface):
                 raise Exception("Clip slot already has a clip")
 
             if not hasattr(clip_slot, "create_audio_clip"):
-                raise Exception(
+                raise CommandError(
                     "ClipSlot.create_audio_clip is unavailable in this Ableton Live "
-                    "version. Requires Live 12.0.5 or newer."
-                )
+                    "version", "not_supported")
 
             clip_slot.create_audio_clip(path)
 
@@ -794,38 +1083,11 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error creating audio clip: " + str(e))
             raise
 
-    def _add_notes_to_clip(self, track_index, clip_index, notes):
+    def _add_notes_to_clip(self, track_index, clip_index, notes, view=None):
         """Add MIDI notes to a clip"""
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            
-            track = self._song.tracks[track_index]
-            
-            if clip_index < 0 or clip_index >= len(track.clip_slots):
-                raise IndexError("Clip index out of range")
-            
-            clip_slot = track.clip_slots[clip_index]
-            
-            if not clip_slot.has_clip:
-                raise Exception("No clip in slot")
-            
-            clip = clip_slot.clip
-
-            # Both paths append; neither replaces existing notes.
-            note_ids = self._add_new_notes(clip, notes)
-            if note_ids is None:
-                live_notes = []
-                for note in notes:
-                    pitch = note.get("pitch", 60)
-                    start_time = note.get("start_time", 0.0)
-                    duration = note.get("duration", 0.25)
-                    velocity = note.get("velocity", 100)
-                    mute = note.get("mute", False)
-
-                    live_notes.append((pitch, start_time, duration, velocity, mute))
-
-                clip.set_notes(tuple(live_notes))
+            clip = self._resolve_clip(track_index, clip_index, view)
+            note_ids = self._add_notes(clip, notes)
 
             result = {
                 "note_count": len(notes)
@@ -836,6 +1098,26 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error adding notes to clip: " + str(e))
             raise
+
+    def _add_notes(self, clip, notes):
+        """Append notes to clip; returns their IDs, or None on the legacy API.
+
+        Both paths append; neither replaces existing notes.
+        """
+        note_ids = self._add_new_notes(clip, notes)
+        if note_ids is None:
+            live_notes = []
+            for note in notes:
+                pitch = note.get("pitch", 60)
+                start_time = note.get("start_time", 0.0)
+                duration = note.get("duration", 0.25)
+                velocity = note.get("velocity", 100)
+                mute = note.get("mute", False)
+
+                live_notes.append((pitch, start_time, duration, velocity, mute))
+
+            clip.set_notes(tuple(live_notes))
+        return note_ids
 
     _EXTENDED_NOTE_FIELDS = ("probability", "velocity_deviation", "release_velocity")
 
@@ -989,9 +1271,17 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error stopping clip: " + str(e))
             raise
 
-    def _delete_clip(self, track_index, clip_index):
-        """Delete the clip in the given clip slot, freeing the slot for reuse."""
+    def _delete_clip(self, track_index, clip_index, view=None):
+        """Delete the clip in the given clip slot, freeing the slot for reuse.
+
+        With view="arrangement", delete the track's clip_index-th arrangement clip.
+        """
         try:
+            if self._check_view(view) == "arrangement":
+                clip = self._resolve_clip(track_index, clip_index, view)
+                self._song.tracks[track_index].delete_clip(clip)
+                return {"deleted": True}
+
             if track_index < 0 or track_index >= len(self._song.tracks):
                 raise IndexError("Track index out of range")
 
@@ -1026,14 +1316,46 @@ class AbletonMCP(ControlSurface):
             raise CommandError("Clip index out of range", "clip_index_out_of_range")
         return track.clip_slots[clip_index]
 
-    def _get_midi_clip(self, track_index, clip_index):
-        slot = self._get_clip_slot(track_index, clip_index)
-        if not slot.has_clip:
-            raise CommandError("No clip in slot", "clip_slot_empty")
-        clip = slot.clip
+    def _get_midi_clip(self, track_index, clip_index, view=None):
+        clip = self._resolve_clip(track_index, clip_index, view)
         if not getattr(clip, "is_midi_clip", False):
             raise CommandError("Clip is not a MIDI clip", "not_midi_clip")
         return clip
+
+    def _check_view(self, view):
+        """Normalise the view parameter: absent means "session"."""
+        if view is None or view == "session":
+            return "session"
+        if view == "arrangement":
+            return "arrangement"
+        raise CommandError(
+            "view must be 'session' or 'arrangement' (got: %s)" % (view,), "invalid_value")
+
+    def _arrangement_clips(self, track):
+        """list(track.arrangement_clips), or [] where the track has none
+        (group, return and master tracks)."""
+        try:
+            return list(track.arrangement_clips)
+        except Exception:
+            return []
+
+    def _resolve_clip(self, track_index, clip_index, view=None):
+        """The clip a command addresses.
+
+        Session: clip_index is the clip slot. Arrangement: clip_index indexes
+        list(track.arrangement_clips), which Live orders by start time.
+        """
+        if self._check_view(view) == "arrangement":
+            clips = self._arrangement_clips(self._get_track(track_index))
+            if clip_index < 0 or clip_index >= len(clips):
+                raise CommandError(
+                    "Clip index out of range (track has %d arrangement clips)" % len(clips),
+                    "clip_index_out_of_range")
+            return clips[clip_index]
+        slot = self._get_clip_slot(track_index, clip_index)
+        if not slot.has_clip:
+            raise CommandError("No clip in slot", "clip_slot_empty")
+        return slot.clip
 
     def _get_scene(self, scene_index):
         if scene_index < 0 or scene_index >= len(self._song.scenes):
@@ -1049,7 +1371,7 @@ class AbletonMCP(ControlSurface):
 
     # ── Note editing (Live 11 note-ID API) ──────────────────────────────────
 
-    def _modify_clip_notes(self, track_index, clip_index, notes):
+    def _modify_clip_notes(self, track_index, clip_index, notes, view=None):
         """Edit existing notes in place, matched by note_id.
 
         apply_note_modifications only accepts the MidiNoteVector Live handed
@@ -1057,7 +1379,7 @@ class AbletonMCP(ControlSurface):
         mutate the matching notes in place and pass the same vector back.
         """
         try:
-            clip = self._get_midi_clip(track_index, clip_index)
+            clip = self._get_midi_clip(track_index, clip_index, view)
 
             changes_by_id = {}
             for note in notes:
@@ -1094,13 +1416,13 @@ class AbletonMCP(ControlSurface):
 
     def _remove_notes_from_clip(self, track_index, clip_index,
                                 from_time=0.0, time_span=-1.0,
-                                from_pitch=0, pitch_span=128):
+                                from_pitch=0, pitch_span=128, view=None):
         """Remove the notes inside a pitch/time window.
 
         A negative time_span means "to the end of the clip".
         """
         try:
-            clip = self._get_midi_clip(track_index, clip_index)
+            clip = self._get_midi_clip(track_index, clip_index, view)
             from_time = float(from_time)
             if time_span is None or time_span < 0:
                 time_span = max(float(clip.length) - from_time, 0.0)
@@ -1319,9 +1641,16 @@ class AbletonMCP(ControlSurface):
             raise
 
     def _set_current_song_time(self, time_val):
-        """Move the arrangement playhead to a position in beats"""
+        """Move the arrangement playhead to a position in beats.
+
+        A generator: Live moves the playhead on its next tick, so wait for it
+        before reading the position back.
+        """
         try:
-            self._song.current_song_time = float(time_val)
+            target = float(time_val)
+            self._song.current_song_time = target
+            yield from self._wait_for(
+                lambda: self._playhead_at(target), max_ticks=5, raise_on_timeout=False)
             return {"current_song_time": self._song.current_song_time}
         except Exception as e:
             self.log_message("Error setting current song time: " + str(e))
@@ -1364,28 +1693,15 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting arrangement clips: " + str(e))
             raise
 
-    def _clear_notes_from_clip(self, track_index, clip_index):
-        """Remove all MIDI notes from a Session clip.
+    def _clear_notes_from_clip(self, track_index, clip_index, view=None):
+        """Remove all MIDI notes from a Session (or arrangement) clip.
 
         Pairs with _add_notes_to_clip to make a real replace (clear, then add),
         which the write-only API otherwise can't do. Counts notes first so the
         result can report how many were removed.
         """
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-
-            track = self._song.tracks[track_index]
-
-            if clip_index < 0 or clip_index >= len(track.clip_slots):
-                raise IndexError("Clip index out of range")
-
-            clip_slot = track.clip_slots[clip_index]
-
-            if not clip_slot.has_clip:
-                raise Exception("No clip in slot")
-
-            clip = clip_slot.clip
+            clip = self._resolve_clip(track_index, clip_index, view)
 
             if not clip.is_midi_clip:
                 raise Exception("Clip is not a MIDI clip; no notes to clear")
@@ -1470,55 +1786,785 @@ class AbletonMCP(ControlSurface):
         """Create (or rename) a named locator at the given beat position.
 
         Uses Live's Song.set_or_delete_cue(), which toggles a cue at the
-        current_song_time. We temporarily move the playhead, toggle, then
-        restore. If a cue already exists at that time we just rename it
-        instead of toggling (which would delete it).
+        playhead. Live moves the playhead on its next tick, so move it, wait
+        until it is there, toggle, wait for the cue, then restore. If a cue
+        already exists at that time just rename it instead of toggling (which
+        would delete it). A generator: see _run_on_main_thread.
         """
         try:
             song = self._song
             target_time = float(time_val)
-            tolerance = 1e-3
-
-            # See if a cue already exists at (or near) the target time
-            existing = None
-            for cue in song.cue_points:
-                if abs(cue.time - target_time) < tolerance:
-                    existing = cue
-                    break
-
-            original_time = song.current_song_time
+            existing = self._cue_at(target_time)
 
             if existing is None:
-                # Move playhead, toggle to create, then locate the new cue
-                song.current_song_time = target_time
-                song.set_or_delete_cue()
-                for cue in song.cue_points:
-                    if abs(cue.time - target_time) < tolerance:
-                        existing = cue
-                        break
-                # Restore playhead
+                original_time = song.current_song_time
                 try:
-                    song.current_song_time = original_time
+                    yield from self._move_playhead(target_time)
+                    if song.is_cue_point_selected():
+                        # Never toggle a cue we did not find: that would delete it.
+                        raise CommandError(
+                            "A cue is selected at %s although none was found at %s; "
+                            "not toggling" % (song.current_song_time, target_time),
+                            "internal_error")
+                    count_before = len(song.cue_points)
+                    song.set_or_delete_cue()
+                    created = yield from self._wait_for(
+                        lambda: self._cue_at(target_time) is not None,
+                        raise_on_timeout=False)
+                    self.log_message(
+                        "create_locator: toggled at %s, cues %d -> %d, created=%s"
+                        % (song.current_song_time, count_before,
+                           len(song.cue_points), created))
+                    if not created:
+                        raise CommandError(
+                            "Failed to create cue at time %s (Live did not add one "
+                            "at the playhead)" % target_time, "internal_error")
                 except Exception:
-                    pass
+                    self._put_playhead_back(original_time)
+                    raise
+                restored = yield from self._restore_playhead(original_time)
+                existing = self._cue_at(target_time)
+            else:
+                restored = None
 
-            if existing is None:
-                raise Exception("Failed to create cue at time " + str(target_time))
-
-            if name:
+            # CuePoint.name is read-only on Live 11 (live_api.cue_point_set_name),
+            # so a rename can fail; the locator exists either way.
+            requested = str(name) if name else None
+            if requested is not None and str(existing.name) != requested:
                 try:
-                    existing.name = str(name)
+                    existing.name = requested
                 except Exception as e:
                     self.log_message("Could not rename locator: " + str(e))
+                else:
+                    yield
+                    existing = self._cue_at(target_time) or existing
 
-            return {
+            result = {
                 "success": True,
                 "time": existing.time,
                 "name": existing.name,
+                "requested_name": requested,
+                "name_applied": requested is None or str(existing.name) == requested,
             }
+            if restored is not None:
+                result["playhead_restored"] = restored
+                result["playhead_time"] = float(song.current_song_time)
+            return result
         except Exception as e:
             self.log_message("Error creating locator: " + str(e))
             raise
+
+    def _playhead_at(self, time_val):
+        return abs(float(self._song.current_song_time) - float(time_val)) <= self._TIME_TOLERANCE
+
+    def _move_playhead(self, time_val):
+        """Generator: move the playhead and wait until Live has moved it."""
+        self.log_message("playhead: %s -> %s" % (self._song.current_song_time, time_val))
+        self._song.current_song_time = float(time_val)
+        landed = yield from self._wait_for(
+            lambda: self._playhead_at(time_val), raise_on_timeout=False)
+        self.log_message("playhead: at %s (target %s, landed=%s)"
+                         % (self._song.current_song_time, time_val, landed))
+        if not landed:
+            raise CommandError(
+                "Could not move the playhead to %s (it is at %s)"
+                % (time_val, self._song.current_song_time), "timeout")
+
+    def _clamp_playhead(self, time_val):
+        """Live refuses a playhead behind song_length, which can shrink while
+        a command runs (moving the playhead can shorten the song)."""
+        time_val = max(0.0, float(time_val))
+        try:
+            return min(time_val, float(self._song.song_length))
+        except Exception:
+            return time_val
+
+    def _put_playhead_back(self, time_val):
+        """Best-effort, same-tick restore for error paths; never raises."""
+        try:
+            self._song.current_song_time = self._clamp_playhead(time_val)
+            return True
+        except Exception as e:
+            self.log_message("playhead: could not restore to %s: %s" % (time_val, e))
+            return False
+
+    def _restore_playhead(self, time_val):
+        """Generator: put the playhead back after a successful edit.
+
+        Never raises: the edit already happened, so a failed restore is only
+        logged. Returns True when the playhead is back at time_val (False
+        when it had to be clamped to the song length or did not move).
+        """
+        target = self._clamp_playhead(time_val)
+        try:
+            self._song.current_song_time = target
+        except Exception as e:
+            self.log_message("playhead: could not restore to %s: %s" % (target, e))
+            return False
+        landed = yield from self._wait_for(
+            lambda: self._playhead_at(target), raise_on_timeout=False)
+        if not landed or target != float(time_val):
+            self.log_message("playhead: restore to %s ended at %s (clamped to %s)"
+                             % (time_val, self._song.current_song_time, target))
+        return landed and abs(target - float(time_val)) <= self._TIME_TOLERANCE
+
+    # ── Arrangement ─────────────────────────────────────────────────────────
+
+    # Tolerance, in beats, for matching a cue or a new clip by its time.
+    _TIME_TOLERANCE = 1e-3
+    # Arrangement positions Track.create_audio_clip accepts, in beats.
+    _MAX_ARRANGEMENT_TIME = 1576800.0
+
+    def _get_arrangement_info(self):
+        """One-call overview of the arrangement timeline."""
+        song = self._song
+        tracks = []
+        for t_index, track in enumerate(song.tracks):
+            clips = []
+            for c_index, clip in enumerate(self._arrangement_clips(track)):
+                clips.append({
+                    "index": c_index,
+                    "name": str(clip.name),
+                    "start_time": float(clip.start_time),
+                    "end_time": float(clip.end_time),
+                    # Timeline length; Clip.length is the loop length.
+                    "length": float(clip.end_time) - float(clip.start_time),
+                    "loop_length": float(clip.length),
+                    "is_midi_clip": bool(getattr(clip, "is_midi_clip", False)),
+                    "muted": bool(getattr(clip, "muted", False)),
+                })
+            tracks.append({
+                "index": t_index,
+                "name": str(track.name),
+                "is_midi_track": bool(getattr(track, "has_midi_input", False)),
+                "is_audio_track": bool(getattr(track, "has_audio_input", False)),
+                "is_group_track": bool(getattr(track, "is_foldable", False)),
+                "clips": clips,
+            })
+        return {
+            "song_length": float(song.song_length),
+            "current_song_time": float(song.current_song_time),
+            "loop": {
+                "enabled": bool(song.loop),
+                "start": float(song.loop_start),
+                "length": float(song.loop_length),
+            },
+            "tempo": float(song.tempo),
+            "signature_numerator": int(song.signature_numerator),
+            "signature_denominator": int(song.signature_denominator),
+            "cue_points": [
+                {"index": i, "name": str(cue.name), "time": float(cue.time)}
+                for i, cue in enumerate(self._sorted_cues())
+            ],
+            "tracks": tracks,
+        }
+
+    def _sorted_cues(self):
+        return sorted(self._song.cue_points, key=lambda cue: float(cue.time))
+
+    def _find_cue(self, name, time_val, exact_time):
+        """Cue by name (case-insensitive, first in time order) or by time.
+
+        exact_time: the cue must sit within _TIME_TOLERANCE of time_val;
+        otherwise the nearest cue is taken. A name takes precedence over a time.
+        """
+        cues = self._sorted_cues()
+        if name is not None:
+            wanted = str(name).lower()
+            for cue in cues:
+                if str(cue.name).lower() == wanted:
+                    return cue
+            raise CommandError("No cue point named '%s'" % name, "cue_not_found")
+        target = float(time_val)
+        best = None
+        for cue in cues:
+            distance = abs(float(cue.time) - target)
+            if best is None or distance < best[0]:
+                best = (distance, cue)
+        if best is None or (exact_time and best[0] > self._TIME_TOLERANCE):
+            raise CommandError("No cue point at time %s" % target, "cue_not_found")
+        return best[1]
+
+    def _cue_at(self, time_val):
+        for cue in self._song.cue_points:
+            if abs(float(cue.time) - float(time_val)) <= self._TIME_TOLERANCE:
+                return cue
+        return None
+
+    @staticmethod
+    def _cue_dict(cue):
+        if cue is None:
+            return None
+        return {"name": str(cue.name), "time": float(cue.time)}
+
+    def _cue_point(self, action, name=None, time_val=None):
+        """Jump to, step through or delete arrangement cue points (locators).
+
+        Not an undoable command: jumps must not push undo steps. Only the
+        delete runs inside one.
+        """
+        song = self._song
+        before = song.current_song_time
+        if action in ("jump", "delete"):
+            if name is None and time_val is None:
+                raise CommandError(
+                    "cue_point %s needs a name or a time" % action, "invalid_value")
+            cue = self._find_cue(name, time_val, exact_time=(action == "delete"))
+            info = self._cue_dict(cue)
+            if action == "jump":
+                cue.jump()
+                # While playing, the jump is quantized, so it may land later.
+                yield from self._wait_for(
+                    lambda: self._playhead_at(info["time"]), max_ticks=3,
+                    raise_on_timeout=False)
+            else:
+                restored = yield from self._in_undo_step(
+                    lambda: self._delete_cue(info["time"]))
+        elif action in ("next", "previous"):
+            if action == "next":
+                song.jump_to_next_cue()
+            else:
+                song.jump_to_prev_cue()
+            # Report where Live actually landed, not the playhead of this tick.
+            yield from self._wait_for(
+                lambda: song.current_song_time != before, max_ticks=3,
+                raise_on_timeout=False)
+            info = self._cue_dict(self._cue_at(song.current_song_time))
+        else:
+            raise CommandError(
+                "Unknown cue_point action: %s (use jump, next, previous or delete)"
+                % (action,), "invalid_value")
+        result = {
+            "action": action,
+            "cue": info,
+            "current_song_time": float(song.current_song_time),
+        }
+        if action == "delete":
+            result["playhead_restored"] = restored
+            result["playhead_time"] = float(song.current_song_time)
+        return result
+
+    def _delete_cue(self, cue_time):
+        """Generator: delete the cue at cue_time.
+
+        set_or_delete_cue toggles at the playhead: it deletes the selected cue
+        or, when none is selected, adds one. So move the playhead onto the cue,
+        wait until Live has moved it, and toggle only when the playhead is on
+        the target and Live reports a cue selected. Restore the playhead after.
+        """
+        song = self._song
+        original_time = song.current_song_time
+        try:
+            yield from self._move_playhead(cue_time)
+            selected = song.is_cue_point_selected()
+            count_before = len(song.cue_points)
+            self.log_message("cue delete: target %s, playhead %s, selected=%s, cues=%d"
+                             % (cue_time, song.current_song_time, selected, count_before))
+            if not (selected and self._playhead_at(cue_time)):
+                raise CommandError("could not select cue", "internal_error")
+            song.set_or_delete_cue()
+            gone = yield from self._wait_for(
+                lambda: self._cue_at(cue_time) is None, raise_on_timeout=False)
+            self.log_message("cue delete: cues %d -> %d, gone=%s"
+                             % (count_before, len(song.cue_points), gone))
+            if not gone:
+                raise CommandError(
+                    "Live did not delete the cue at %s" % cue_time, "timeout")
+        except Exception:
+            self._put_playhead_back(original_time)
+            raise
+        restored = yield from self._restore_playhead(original_time)
+        return restored
+
+    def _set_arrangement_loop(self, enabled=None, start=None, length=None):
+        """Set the arrangement loop switch and/or its start and length (beats)."""
+        song = self._song
+        if start is not None:
+            start = float(start)
+            if start < 0:
+                raise CommandError("Loop start must be >= 0 (got %s)" % start, "invalid_value")
+        if length is not None:
+            length = float(length)
+            if length <= 0:
+                raise CommandError("Loop length must be > 0 (got %s)" % length, "invalid_value")
+        if start is not None:
+            song.loop_start = start
+        if length is not None:
+            song.loop_length = length
+        if enabled is not None:
+            song.loop = bool(enabled)
+        # Live applies these on its next tick; reading back now sees old values.
+        yield from self._wait_for(
+            lambda: (enabled is None or bool(song.loop) == bool(enabled))
+            and (start is None or abs(float(song.loop_start) - start) <= self._TIME_TOLERANCE)
+            and (length is None or abs(float(song.loop_length) - length) <= self._TIME_TOLERANCE),
+            max_ticks=5, raise_on_timeout=False)
+        return {
+            "enabled": bool(song.loop),
+            "start": float(song.loop_start),
+            "length": float(song.loop_length),
+        }
+
+    def _check_arrangement_overlap(self, track, start, end=None):
+        """Raise clip_overlap if an arrangement clip overlaps [start, end).
+
+        Without an end (length unknown, e.g. before an audio import) only a
+        clip covering start counts.
+        """
+        for index, clip in enumerate(self._arrangement_clips(track)):
+            clip_start = float(clip.start_time)
+            clip_end = float(clip.end_time)
+            if end is None:
+                overlaps = clip_start <= start < clip_end
+            else:
+                overlaps = clip_start < end and clip_end > start
+            if overlaps:
+                raise CommandError(
+                    "Overlaps arrangement clip %d '%s' (%s-%s); pass allow_overlap "
+                    "to place it anyway" % (index, clip.name, clip_start, clip_end),
+                    "clip_overlap")
+
+    def _find_new_arrangement_clip(self, track, before, start, created=None):
+        """(index, clip) of a clip just added to the track's arrangement.
+
+        Prefer the clip Live returned; otherwise the clip at start that was
+        not there before (create_audio_clip returns None).
+        """
+        clips = self._arrangement_clips(track)
+        if created is not None:
+            for index, clip in enumerate(clips):
+                if clip == created:
+                    return index, clip
+        for index, clip in enumerate(clips):
+            if abs(float(clip.start_time) - start) > self._TIME_TOLERANCE:
+                continue
+            if not any(clip == old for old in before):
+                return index, clip
+        raise CommandError(
+            "Could not find the new arrangement clip at %s" % start, "internal_error")
+
+    def _create_arrangement_midi_clip(self, track_index, start, length, notes=None,
+                                      name=None, allow_overlap=False):
+        """Create a MIDI clip in the arrangement, with optional notes and name.
+
+        Live 12 has Track.create_midi_clip. Live 11 does not, so build the clip
+        in a free Session slot, duplicate it to the arrangement and delete the
+        temporary Session clip. The command runs as one undo step either way.
+        """
+        original_time = None
+        try:
+            track = self._get_track(track_index)
+            if not getattr(track, "has_midi_input", False):
+                raise CommandError("Track %d is not a MIDI track" % track_index, "not_midi_track")
+            start = float(start)
+            length = float(length)
+            if start < 0:
+                raise CommandError("Start must be >= 0 (got %s)" % start, "invalid_value")
+            if length <= 0:
+                raise CommandError("Length must be > 0 (got %s)" % length, "invalid_value")
+            notes = notes or []
+            if not allow_overlap:
+                self._check_arrangement_overlap(track, start, start + length)
+
+            before = self._arrangement_clips(track)
+            original_time = self._song.current_song_time
+            if hasattr(track, "create_midi_clip"):
+                method = "create_midi_clip"
+                created = track.create_midi_clip(start, length)
+                index, clip = self._find_new_arrangement_clip(track, before, start, created)
+                if name:
+                    clip.name = str(name)
+                self._add_notes(clip, notes)
+            else:
+                method = "session_fallback"
+                slot = None
+                for candidate in track.clip_slots:
+                    if not candidate.has_clip:
+                        slot = candidate
+                        break
+                if slot is None:
+                    raise CommandError(
+                        "Track %d has no empty Session clip slot to build the clip in "
+                        "(this Live has no Track.create_midi_clip)" % track_index,
+                        "no_free_clip_slot")
+                slot.create_clip(length)
+                try:
+                    temp = slot.clip
+                    if name:
+                        temp.name = str(name)
+                    self._add_notes(temp, notes)
+                    created = track.duplicate_clip_to_arrangement(temp, start)
+                finally:
+                    if slot.has_clip:
+                        slot.delete_clip()
+                index, clip = self._find_new_arrangement_clip(track, before, start, created)
+
+            # duplicate_clip_to_arrangement moves the playhead to the new clip
+            # (on the next tick); put it back where the user left it.
+            yield
+            restored = yield from self._restore_playhead(original_time)
+            return {
+                "track_index": track_index,
+                "clip_index": index,
+                "name": str(clip.name),
+                "start_time": float(clip.start_time),
+                "end_time": float(clip.end_time),
+                "note_count": len(notes),
+                "method": method,
+                "playhead_restored": restored,
+                "playhead_time": float(self._song.current_song_time),
+            }
+        except Exception as e:
+            self.log_message("Error creating arrangement MIDI clip: " + str(e))
+            if original_time is not None:
+                self._put_playhead_back(original_time)
+            raise
+
+    def _create_arrangement_audio_clip(self, track_index, path, start, allow_overlap=False):
+        """Import an audio file into the arrangement with Track.create_audio_clip.
+
+        Live moves the playhead to the new clip; it is put back afterwards.
+        """
+        original_time = None
+        try:
+            if not path:
+                raise CommandError("Audio file path is required", "invalid_audio_file")
+            if not os.path.isabs(path):
+                raise CommandError(
+                    "Audio file path must be absolute (got: %s)" % path, "invalid_audio_file")
+            if not os.path.isfile(path):
+                raise CommandError("Audio file not found: %s" % path, "invalid_audio_file")
+
+            track = self._get_track(track_index)
+            if getattr(track, "has_midi_input", False) or not getattr(track, "has_audio_input", True):
+                raise CommandError("Track %d is not an audio track" % track_index, "not_audio_track")
+            start = float(start)
+            if start < 0 or start > self._MAX_ARRANGEMENT_TIME:
+                raise CommandError(
+                    "Start must be between 0 and %s beats (got %s)"
+                    % (self._MAX_ARRANGEMENT_TIME, start), "invalid_value")
+            if not hasattr(track, "create_audio_clip"):
+                raise CommandError(
+                    "Track.create_audio_clip is unavailable in this Ableton Live version",
+                    "not_supported")
+            if not allow_overlap:
+                self._check_arrangement_overlap(track, start)
+
+            before = self._arrangement_clips(track)
+            original_time = self._song.current_song_time
+            track.create_audio_clip(path, start)
+            index, clip = self._find_new_arrangement_clip(track, before, start)
+            yield
+            restored = yield from self._restore_playhead(original_time)
+            return {
+                "track_index": track_index,
+                "clip_index": index,
+                "name": str(clip.name),
+                "start_time": float(clip.start_time),
+                "end_time": float(clip.end_time),
+                "length": float(clip.length),
+                "playhead_restored": restored,
+                "playhead_time": float(self._song.current_song_time),
+            }
+        except Exception as e:
+            self.log_message("Error creating arrangement audio clip: " + str(e))
+            if original_time is not None:
+                self._put_playhead_back(original_time)
+            raise
+
+    # key -> cast, in the order they are applied. warping comes before the
+    # markers because it changes their unit (beats vs seconds).
+    _CLIP_PROPERTIES = (
+        ("name", str),
+        ("muted", bool),
+        ("color", int),
+        ("looping", bool),
+        ("warping", bool),
+        ("warp_mode", int),
+        ("loop_start", float),
+        ("loop_end", float),
+        ("start_marker", float),
+        ("end_marker", float),
+        ("gain", float),
+        ("pitch_coarse", int),
+        ("pitch_fine", float),
+    )
+    _AUDIO_ONLY_CLIP_PROPERTIES = frozenset(
+        ["gain", "pitch_coarse", "pitch_fine", "warping", "warp_mode"])
+    _MARKER_PAIRS = (("loop_start", "loop_end"), ("start_marker", "end_marker"))
+
+    def _set_clip_properties(self, track_index, clip_index, view=None, properties=None):
+        """Set several clip properties at once; all are validated first."""
+        try:
+            casts = dict(self._CLIP_PROPERTIES)
+            allowed = [key for key, _cast in self._CLIP_PROPERTIES]
+            if not isinstance(properties, dict) or not properties:
+                raise CommandError(
+                    "properties must be a non-empty object with any of: %s"
+                    % ", ".join(allowed), "invalid_value")
+            unknown = sorted(key for key in properties if key not in casts)
+            if unknown:
+                raise CommandError(
+                    "Unknown clip properties: %s. Allowed: %s"
+                    % (", ".join(unknown), ", ".join(allowed)), "invalid_value")
+
+            clip = self._resolve_clip(track_index, clip_index, view)
+            if getattr(clip, "is_midi_clip", False):
+                audio_only = sorted(set(properties) & self._AUDIO_ONLY_CLIP_PROPERTIES)
+                if audio_only:
+                    raise CommandError(
+                        "Audio-clip-only properties on a MIDI clip: %s"
+                        % ", ".join(audio_only), "not_audio_clip")
+
+            values = {}
+            for key, value in properties.items():
+                try:
+                    values[key] = casts[key](value)
+                except (TypeError, ValueError):
+                    raise CommandError(
+                        "Invalid value for %s: %r" % (key, value), "invalid_value")
+            for low, high in self._MARKER_PAIRS:
+                if low in values and high in values and values[low] >= values[high]:
+                    raise CommandError(
+                        "%s must be less than %s" % (low, high), "invalid_value")
+
+            order = [key for key in allowed if key in values]
+            for low, high in self._MARKER_PAIRS:
+                # Live rejects low >= high at every step: when both move, set
+                # first whichever one keeps the pair valid against the other's
+                # current value.
+                if low in values and high in values \
+                        and values[low] >= float(getattr(clip, high)):
+                    i, j = order.index(low), order.index(high)
+                    order[i], order[j] = high, low
+
+            for key in order:
+                setattr(clip, key, values[key])
+
+            # Let Live apply the writes before reading them back.
+            yield
+            return {"properties": dict(
+                (key, casts[key](getattr(clip, key))) for key in properties)}
+        except Exception as e:
+            self.log_message("Error setting clip properties: " + str(e))
+            raise
+
+    # ── Devices and racks ───────────────────────────────────────────────────
+
+    def _locate_device(self, track_index, device_index,
+                       chain_index=None, chain_device_index=None):
+        """(device, owner, index): the addressed device, the track or rack
+        chain holding it, and its index there (for owner.delete_device).
+
+        chain_index addresses a chain of the rack at device_index, and
+        chain_device_index (default 0) a device in that chain. One level of
+        nesting only.
+        """
+        if chain_index is None and chain_device_index is not None:
+            raise CommandError(
+                "chain_device_index needs chain_index", "invalid_value")
+        track = self._get_track(track_index)
+        devices = list(track.devices)
+        device_index = int(device_index)
+        if device_index < 0 or device_index >= len(devices):
+            raise CommandError(
+                "Device index out of range (track has %d devices)" % len(devices),
+                "device_index_out_of_range")
+        device = devices[device_index]
+        if chain_index is None:
+            return device, track, device_index
+
+        if not getattr(device, "can_have_chains", False):
+            raise CommandError("Device '%s' is not a rack" % device.name, "not_a_rack")
+        chains = list(device.chains)
+        chain_index = int(chain_index)
+        if chain_index < 0 or chain_index >= len(chains):
+            raise CommandError(
+                "Chain index out of range (rack '%s' has %d chains)"
+                % (device.name, len(chains)), "chain_index_out_of_range")
+        chain = chains[chain_index]
+        chain_devices = list(chain.devices)
+        index = int(chain_device_index or 0)
+        if index < 0 or index >= len(chain_devices):
+            raise CommandError(
+                "Device index out of range (chain '%s' has %d devices)"
+                % (chain.name, len(chain_devices)), "device_index_out_of_range")
+        return chain_devices[index], chain, index
+
+    def _resolve_device(self, track_index, device_index,
+                        chain_index=None, chain_device_index=None):
+        return self._locate_device(
+            track_index, device_index, chain_index, chain_device_index)[0]
+
+    def _resolve_parameter_index(self, device, parameter_index=None, parameter_name=None):
+        """Index of the parameter given by index or by (case-insensitive) name."""
+        params = list(device.parameters)
+        if (parameter_index is None) == (parameter_name is None):
+            raise CommandError(
+                "Give exactly one of parameter_index and parameter_name", "invalid_value")
+        if parameter_index is not None:
+            parameter_index = int(parameter_index)
+            if parameter_index < 0 or parameter_index >= len(params):
+                raise CommandError(
+                    "Parameter index out of range (device has %d parameters)" % len(params),
+                    "parameter_index_out_of_range")
+            return parameter_index
+        wanted = str(parameter_name).lower()
+        matches = [i for i, param in enumerate(params) if str(param.name).lower() == wanted]
+        if not matches:
+            names = [str(param.name) for param in params]
+            more = " ..." if len(names) > 20 else ""
+            raise CommandError(
+                "No parameter named '%s' on '%s'. Parameters: %s%s"
+                % (parameter_name, device.name, ", ".join(names[:20]), more),
+                "parameter_not_found")
+        if len(matches) > 1:
+            raise CommandError(
+                "Several parameters are named '%s' (indices %s); use parameter_index"
+                % (parameter_name, matches), "invalid_value")
+        return matches[0]
+
+    def _get_rack_info(self, track_index, device_index,
+                       chain_index=None, chain_device_index=None):
+        """Macros, chains (with their devices) and filled drum pads of a rack."""
+        rack = self._resolve_device(track_index, device_index, chain_index, chain_device_index)
+        if not getattr(rack, "can_have_chains", False):
+            raise CommandError("Device '%s' is not a rack" % rack.name, "not_a_rack")
+
+        params = list(rack.parameters)
+        macro_count = int(getattr(rack, "visible_macro_count", 8))
+        macros = []
+        # parameters[0] is "Device On"; the macros follow it.
+        for index in range(1, min(1 + macro_count, len(params))):
+            param = params[index]
+            macros.append({
+                "index": index,
+                "name": str(param.name),
+                "value": float(param.value),
+                "min": float(param.min),
+                "max": float(param.max),
+            })
+
+        rack_chains = list(rack.chains)
+        chains = []
+        for c_index, chain in enumerate(rack_chains):
+            devices = []
+            for d_index, device in enumerate(chain.devices):
+                devices.append({
+                    "index": d_index,
+                    "name": str(device.name),
+                    "class_name": str(device.class_name),
+                    "type": self._get_device_type(device),
+                    "is_active": bool(getattr(device, "is_active", True)),
+                    "is_rack": bool(getattr(device, "can_have_chains", False)),
+                })
+            chains.append({
+                "index": c_index,
+                "name": str(chain.name),
+                "mute": bool(getattr(chain, "mute", False)),
+                "solo": bool(getattr(chain, "solo", False)),
+                "devices": devices,
+            })
+
+        is_drum_rack = bool(getattr(rack, "can_have_drum_pads", False))
+        drum_pads = []
+        if is_drum_rack:
+            for pad in rack.drum_pads:
+                pad_chains = list(pad.chains)
+                if not pad_chains:
+                    continue
+                drum_pads.append({
+                    "note": int(pad.note),
+                    "name": str(pad.name),
+                    "mute": bool(pad.mute),
+                    "solo": bool(pad.solo),
+                    # Live hands out a new wrapper per access, so compare with
+                    # == (same underlying chain) rather than `is`.
+                    "chain_indices": [i for i, chain in enumerate(rack_chains)
+                                      if any(chain == pc for pc in pad_chains)],
+                })
+
+        return {
+            "track_index": track_index,
+            "device_index": device_index,
+            "chain_index": chain_index,
+            "chain_device_index": chain_device_index,
+            "name": str(rack.name),
+            "class_name": str(rack.class_name),
+            "is_drum_rack": is_drum_rack,
+            "macros": macros,
+            "chains": chains,
+            "drum_pads": drum_pads,
+        }
+
+    def _device_on_parameter(self, device):
+        params = list(device.parameters)
+        if params:
+            param = params[0]
+            name = getattr(param, "original_name", None) or param.name
+            if str(name) == "Device On":
+                return param
+        raise CommandError(
+            "'%s' has no 'Device On' parameter" % device.name, "not_supported")
+
+    def _set_device_enabled(self, track_index, device_index, enabled,
+                            chain_index=None, chain_device_index=None):
+        """Turn a device on or off through its "Device On" parameter
+        (Device.is_active is read-only). A generator: reads back after a tick."""
+        device = self._resolve_device(track_index, device_index, chain_index, chain_device_index)
+        param = self._device_on_parameter(device)
+        param.value = param.max if enabled else param.min
+        yield
+        return {
+            "name": str(device.name),
+            "enabled": float(param.value) == float(param.max),
+            "is_active": bool(getattr(device, "is_active", True)),
+        }
+
+    def _delete_device(self, track_index, device_index,
+                       chain_index=None, chain_device_index=None):
+        device, owner, index = self._locate_device(
+            track_index, device_index, chain_index, chain_device_index)
+        name = str(device.name)
+        owner.delete_device(index)
+        return {
+            "deleted": name,
+            "track_index": track_index,
+            "device_index": device_index,
+            "chain_index": chain_index,
+            "chain_device_index": chain_device_index,
+        }
+
+    def _navigate_device_preset(self, track_index, device_index, direction,
+                                chain_index=None, chain_device_index=None):
+        """Step through a plugin device's presets. A generator: reads back
+        after a tick. Not undoable (Live does not record preset changes)."""
+        if direction not in ("next", "previous", "current"):
+            raise CommandError(
+                "direction must be 'next', 'previous' or 'current' (got: %s)"
+                % (direction,), "invalid_value")
+        device = self._resolve_device(track_index, device_index, chain_index, chain_device_index)
+        presets = getattr(device, "presets", None)
+        presets = list(presets) if presets is not None else []
+        if not presets:
+            raise CommandError("'%s' has no presets" % device.name, "not_supported")
+
+        current = int(device.selected_preset_index)
+        if direction != "current":
+            step = 1 if direction == "next" else -1
+            target = min(max(current + step, 0), len(presets) - 1)
+            if target != current:
+                device.selected_preset_index = target
+                yield
+
+        index = int(device.selected_preset_index)
+        presets = list(device.presets)
+        return {
+            "name": str(device.name),
+            "preset_index": index,
+            "preset_name": str(presets[index]) if 0 <= index < len(presets) else None,
+            "preset_count": len(presets),
+        }
 
     # ── Browser implementations ───────────────────────────────────────────────
 
@@ -1620,6 +2666,9 @@ class AbletonMCP(ControlSurface):
         """
         return self._load_browser_item(track_index, uri)
 
+    # Ticks to wait for a loaded device to appear (Live loads asynchronously).
+    _LOAD_WAIT_TICKS = 30
+
     def _load_browser_item(self, track_index, item_uri):
         """Load a browser item onto a track by its URI"""
         try:
@@ -1639,17 +2688,46 @@ class AbletonMCP(ControlSurface):
             
             # Select the track
             self._song.view.selected_track = track
-            
-            # Load the item
+
+            before = list(track.devices)
+            before_names = [str(d.name) for d in before]
+
+            # Load the item. Live adds the device on a later tick, so wait for
+            # the device list to change before reporting it.
             app.browser.load_item(item)
-            
-            result = {
+
+            def current():
+                return list(track.devices)
+
+            def changed():
+                after = current()
+                if len(after) != len(before):
+                    return True
+                return any(not (a == b) for a, b in zip(after, before))
+
+            ticks = 0
+            while ticks < self._LOAD_WAIT_TICKS and not changed():
+                yield
+                ticks += 1
+
+            after = current()
+            new_devices = [str(d.name) for d in after
+                           if not any(d == b for b in before)]
+            devices_after = [str(d.name) for d in after]
+            devices_changed = changed()
+            self.log_message(
+                "load_browser_item: %s on '%s': devices %s -> %s after %d ticks "
+                "(changed=%s)" % (item_uri, track.name, before_names, devices_after,
+                                  ticks, devices_changed))
+            return {
                 "loaded": True,
                 "item_name": item.name,
                 "track_name": track.name,
-                "uri": item_uri
+                "uri": item_uri,
+                "new_devices": new_devices,
+                "devices_after": devices_after,
+                "devices_changed": devices_changed,
             }
-            return result
         except Exception as e:
             self.log_message("Error loading browser item: {0}".format(str(e)))
             self.log_message(traceback.format_exc())
@@ -1873,23 +2951,30 @@ class AbletonMCP(ControlSurface):
             "macros_mapped": list(getattr(rack, "macros_mapped", [])),
         }
     
+    # Live.Device.DeviceType values (0 = undefined).
+    _DEVICE_TYPES = {1: "instrument", 2: "audio_effect", 4: "midi_effect"}
+
     def _get_device_type(self, device):
-        """Get the type of a device"""
+        """drum_machine / rack, else Live's own Device.type.
+
+        This used to guess from class names ("instrument" in the display
+        name...), which Live's names don't follow, so most devices came back
+        "unknown".
+        """
         try:
-            # Simple heuristic - in a real implementation you'd look at the device class
-            if device.can_have_drum_pads:
+            if getattr(device, "can_have_drum_pads", False):
                 return "drum_machine"
-            elif device.can_have_chains:
+            if getattr(device, "can_have_chains", False):
                 return "rack"
-            elif "instrument" in device.class_display_name.lower():
-                return "instrument"
-            elif "audio_effect" in device.class_name.lower():
-                return "audio_effect"
-            elif "midi_effect" in device.class_name.lower():
-                return "midi_effect"
-            else:
+            live_type = getattr(device, "type", None)
+            name = getattr(live_type, "name", None)
+            if name in ("instrument", "audio_effect", "midi_effect"):
+                return str(name)
+            try:
+                return self._DEVICE_TYPES.get(int(live_type), "unknown")
+            except (TypeError, ValueError):
                 return "unknown"
-        except:
+        except Exception:
             return "unknown"
 
     # ── Passive human-UI listeners ──────────────────────────────────────────────
@@ -2264,7 +3349,8 @@ class AbletonMCP(ControlSurface):
     # a snapshot can never blow the stack or the payload size.
     _MAX_CHAIN_DEPTH = 4
 
-    def _serialize_device(self, device, device_index, include_params=True, depth=0):
+    def _serialize_device(self, device, device_index, include_params=True, depth=0,
+                          include_value_items=False):
         info = {
             "index": device_index,
             "name": device.name,
@@ -2294,6 +3380,12 @@ class AbletonMCP(ControlSurface):
                         }
                         if hasattr(param, "value_string"):
                             entry["value_string"] = str(param.value_string)
+                        if include_value_items and entry["is_quantized"]:
+                            # Named switch positions; raises when not quantized.
+                            try:
+                                entry["value_items"] = [str(v) for v in param.value_items]
+                            except Exception:
+                                pass
                         if hasattr(param, "automation_state"):
                             try:
                                 entry["automation_state"] = int(param.automation_state)
@@ -2502,17 +3594,9 @@ class AbletonMCP(ControlSurface):
             self.log_message("master_track serialize failed: " + str(e))
             return None
 
-    def _get_clip_notes(self, track_index, clip_index):
+    def _get_clip_notes(self, track_index, clip_index, view=None):
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            track = self._song.tracks[track_index]
-            if clip_index < 0 or clip_index >= len(track.clip_slots):
-                raise IndexError("Clip index out of range")
-            slot = track.clip_slots[clip_index]
-            if not slot.has_clip:
-                raise Exception("No clip in slot")
-            clip = slot.clip
+            clip = self._resolve_clip(track_index, clip_index, view)
             if not getattr(clip, "is_midi_clip", False):
                 raise Exception("Clip is not a MIDI clip")
             notes = self._notes_from_clip(clip)
@@ -2528,17 +3612,16 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting clip notes: " + str(e))
             raise
 
-    def _get_device_parameters(self, track_index, device_index):
+    def _get_device_parameters(self, track_index, device_index,
+                               chain_index=None, chain_device_index=None):
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            track = self._song.tracks[track_index]
-            if device_index < 0 or device_index >= len(track.devices):
-                raise IndexError("Device index out of range")
-            device = track.devices[device_index]
+            device = self._resolve_device(
+                track_index, device_index, chain_index, chain_device_index)
+            index = device_index if chain_index is None else (chain_device_index or 0)
             return {
                 "track_index": track_index,
-                "device": self._serialize_device(device, device_index, include_params=True),
+                "device": self._serialize_device(
+                    device, index, include_params=True, include_value_items=True),
             }
         except Exception as e:
             self.log_message("Error getting device parameters: " + str(e))
@@ -2620,16 +3703,16 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting session snapshot: " + str(e))
             raise
 
-    def _set_device_parameter(self, track_index, device_index, parameter_index, value):
+    def _set_device_parameter(self, track_index, device_index, parameter_index=None,
+                              value=0.0, parameter_name=None,
+                              chain_index=None, chain_device_index=None):
+        """Set one parameter, addressed by index or by name. A generator: the
+        value is read back after Live has applied it."""
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            track = self._song.tracks[track_index]
-            if device_index < 0 or device_index >= len(track.devices):
-                raise IndexError("Device index out of range")
-            device = track.devices[device_index]
-            if parameter_index < 0 or parameter_index >= len(device.parameters):
-                raise IndexError("Parameter index out of range")
+            device = self._resolve_device(
+                track_index, device_index, chain_index, chain_device_index)
+            parameter_index = self._resolve_parameter_index(
+                device, parameter_index, parameter_name)
             param = device.parameters[parameter_index]
             # Live silently clamps out-of-range values, which hides mistakes.
             value = self._check_range(
@@ -2638,6 +3721,9 @@ class AbletonMCP(ControlSurface):
                 code="parameter_value_out_of_range")
             old = float(param.value)
             param.value = value
+            yield from self._wait_for(
+                lambda: abs(float(param.value) - value) < 1e-6,
+                max_ticks=3, raise_on_timeout=False)
             return {
                 "track_index": track_index,
                 "device_index": device_index,

@@ -9,7 +9,10 @@ to the Remote Script.
 1. Run `ableton-mcp-install-script`, then restart Live.
 2. Open a fresh, empty Live set.
 3. Start the MCP server and call `get_remote_script_info`. Confirm it reports
-   script version 1.8.1 and `up_to_date: true`.
+   script version 1.11.1 and `up_to_date: true`. Confirm `live_version` shows
+   your Live build and `live_api` lists the version-dependent APIs (on Live 11
+   expect `track_create_midi_clip: false`, `song_begin_undo_step: true`,
+   `automation_envelope_insert_step: true`).
 4. Keep Live visible so you can confirm each change in the UI.
 
 ## Note editing (Live 11+ note IDs)
@@ -60,6 +63,94 @@ to the Remote Script.
    inside the reported range. Then try a value above `max` and confirm a
    `parameter_value_out_of_range` error with the parameter unchanged.
 
+## Arrangement (1.10.2)
+
+Start with at least one MIDI track (with an instrument and one empty Session
+slot) and one audio track. Clear leftovers from earlier runs first: stray
+locators, the loop, test clips. Live restarts to load a new Remote Script, so
+rebuild the test tracks after each update.
+
+1. Call `get_arrangement_info`. Confirm song length, loop, time signature,
+   cue points and each track's arrangement clips, with bar numbers that match
+   Live's ruler. A clip's `length` is its span on the timeline; `loop_length`
+   is Live's loop length (they differ for a looped clip).
+2. Call `create_arrangement_midi_clip` on the MIDI track with `start_bar=5`,
+   `length_bars=2` and a few notes (use note names). Confirm the clip appears
+   at bar 5, two bars long, with the notes, and that the temporary Session clip
+   is gone. On Live 11 the result ends with `(method: session_fallback)`.
+   The playhead must be back where it was before the call. Also try it with
+   the playhead parked past the end of the song: the clip is still created
+   and the call succeeds, with a note that the playhead couldn't be restored.
+3. Call it again overlapping that clip: expect `clip_overlap`. Call `undo`
+   once and confirm the whole first clip disappears in one step (no leftover
+   Session clip).
+4. Call `get_clip_notes` / `add_notes_to_clip` / `modify_clip_notes` /
+   `remove_notes_from_clip` with `view="arrangement"` on the new clip; confirm
+   each change lands on the Arrangement clip, not a Session clip.
+5. Call `set_clip_properties` with `view="arrangement"` and
+   `{"name": "Verse", "muted": true, "looping": true, "loop_start": 0, "loop_end": 4}`.
+   Confirm in Live. Then try `{"gain": 0.5}` on the MIDI clip: expect
+   `not_audio_clip`.
+6. Call `create_arrangement_audio_clip` on the audio track with a real `.wav`
+   at `start_bar=9`. Confirm the clip lands at bar 9 and the playhead returns
+   to where it was. Try a missing file:
+   `invalid_audio_file`.
+7. Park the playhead somewhere else (e.g. bar 20), then create two locators
+   with `create_locator` at bar 1 (time 0) and bar 5 (time 16). Both must land
+   at those times — not at the playhead — and the playhead must return to
+   bar 20. Names: on Live 11 scripts can't rename locators
+   (`live_api.cue_point_set_name: false`), so the reply must say the locator
+   kept Live's name ("1", "2"); on Live 12 the requested names apply. Then `cue_point` with `jump` by name, `next`,
+   `previous` (each reports the cue it actually landed on), `jump` by the
+   name Live gave it, and `delete` by
+   name: only that locator disappears, no new one appears, jumps add no undo
+   steps, and one `undo` restores the deleted locator. (Before 1.10.1 these
+   acted at the old playhead position.)
+8. Call `set_arrangement_time` with 40, then 76: each reply reports where the
+   playhead actually is (40 and 76).
+9. Call `set_arrangement_loop` with `start_bar=5`, `length_bars=4`,
+   `enabled=true`; confirm the loop brace and that the reply says the loop is
+   on.
+10. Call `delete_clip` with `view="arrangement"` on the audio clip; confirm it
+   is removed from the Arrangement only.
+
+## Devices and racks (1.11.0)
+
+Setup: a MIDI track with an Instrument Rack (e.g. load any preset from
+Instruments that is a rack, or group Drift + an effect with Cmd+G), a MIDI
+track with a Drum Rack kit (`load_drum_kit` or drag one in), and a track with
+a third-party plugin (VST/AU) if you have one.
+
+1. `load_instrument_or_effect` on an empty MIDI track: the reply names the
+   new device ("New devices: Drift"), not an empty list.
+2. `get_rack_info` on the Instrument Rack: chains, the devices in each chain,
+   and the visible macros with values. On a plain device: `not_a_rack`.
+3. `get_rack_info` on the Drum Rack: `is_drum_rack: true`, only filled pads,
+   and each pad's `chain_indices` is **not empty** (it maps pads to chains;
+   an empty list would mean Live objects don't compare equal as expected).
+   Confirmed on 11.3.43 with "808 Core Kit" (mapping follows the chains, not
+   list order). An empty Drum Rack has no pads to check — load a kit.
+   Chain devices report their real `type` (Utility → `audio_effect`) since
+   1.11.1.
+4. `get_device_parameters` with `chain_index` / `chain_device_index` on a
+   device inside a rack chain — including the **second** device in a chain.
+   Quantized parameters (e.g. a filter type) list `value_items`.
+5. `set_device_parameter` on that chain device by `parameter_name` (e.g.
+   "Filter Freq" or whatever `get_device_parameters` shows): the knob moves
+   in Live. A wrong name gives `parameter_not_found`; an out-of-range value
+   gives `parameter_value_out_of_range` and nothing changes.
+6. `set_device_enabled` off, then on, for a top-level device and a chain
+   device: the device's on/off switch follows, and the reply matches.
+7. `delete_device` on a chain device: only that device goes. `undo` brings it
+   back in one step.
+8. `navigate_device_preset` on the plugin: `current`, then `next`, then
+   `previous` — the reply names the preset Live shows. On a Live device (e.g.
+   Drift): `not_supported`. Needs a plugin that exposes its program list to
+   Live: Serum 2 shows a single "Default" preset, so stepping can't be
+   exercised with it (still open).
+9. Past-the-end playhead: repeat Arrangement step 2 with the playhead past the
+   end of the song; the note says where the playhead stopped (beat and bar).
+
 ## Scenes
 
 1. Call `get_session_info`. Confirm `scene_count` and `scenes` are present.
@@ -69,9 +160,12 @@ to the Remote Script.
 
 ## Errors and connection
 
-1. Call `set_track_mute` with a track index that does not exist. Confirm the
+1. Call `create_audio_clip` on an empty audio slot with a path that does not
+   exist, then with a text file renamed to `.wav`. Both should end with
+   `(code: invalid_audio_file)`. Then a real `.wav`: the clip appears.
+2. Call `set_track_mute` with a track index that does not exist. Confirm the
    error ends with `(code: track_index_out_of_range)`.
-2. Immediately call `get_session_info`. Confirm it answers without a reconnect:
+3. Immediately call `get_session_info`. Confirm it answers without a reconnect:
    the MCP server log (Claude Desktop: `~/Library/Logs/Claude/mcp-server-AbletonMCP.log`)
    shows no new "Connected to Ableton" line.
 
@@ -82,4 +176,18 @@ to the Remote Script.
    took 6.4 s and 31 KB; the log line "Received complete response" gives the
    size, and its timestamp against "Sending command" gives the duration.
 2. `max_depth` is capped at 2: depth 3 took 9.8 s and 634 KB, against a 10 s
-   read timeout.
+   read timeout. Asking for 3 returns the depth-2 tree with a "max_depth
+   capped at 2" line.
+
+## Live API dump (developer)
+
+1. With Live running, run
+   `uv --directory /Volumes/ADrive/Gits/ableton-mcp-vitraya run ableton-mcp-dump-live-api`.
+   It writes `docs/live-api/<your Live version>/` with one JSON file per
+   module and an `index.md` (gitignored).
+2. Open `index.md` and confirm `Track`, `Song`, `Clip` and `ClipSlot` list
+   members with signatures in the Doc column. Check whether `ClipSlot`
+   has `create_audio_clip` and note the result in
+   `docs/extended-features-plan.md` (it decides a Phase 1 detail).
+3. Check the MCP server log: each module request should finish well inside
+   the 60 s allowance.

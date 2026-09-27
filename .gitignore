@@ -70,6 +70,9 @@ exports/
 
 local_tests/
 
+# Live API dump — generated from the user's own Live install
+docs/live-api/
+
 
 # Lock files (optional - uncomment if you don't want to track)
 # uv.lock

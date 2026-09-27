@@ -1,7 +1,7 @@
 [project]
 name = "ableton-mcp"
-version = "1.4.5"
-description = "Ableton Live integration through the Model Context Protocol"
+version = "2.0.0"
+description = "Ableton MCP 2.0: Ableton Live integration through the Model Context Protocol"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
@@ -21,6 +21,7 @@ dependencies = [
 [project.scripts]
 ableton-mcp = "MCP_Server.server:main"
 ableton-mcp-install-script = "MCP_Server.remote_script_install:main"
+ableton-mcp-dump-live-api = "MCP_Server.live_api_dump:main"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]

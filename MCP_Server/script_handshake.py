@@ -56,6 +56,36 @@ def script_version_ok() -> bool:
     return str(info.get("script_version") or "") == EXPECTED_REMOTE_SCRIPT_VERSION
 
 
+def live_api_available(flag: str) -> bool:
+    """True if the running Live reports the optional API ``flag`` (see
+    ``live_api`` in get_script_info). False when unknown."""
+    info = get_cached_script_info()
+    if not info or info.get("script_version") in (None, "legacy"):
+        return False
+    flags = info.get("live_api")
+    if not isinstance(flags, dict):
+        return False
+    return flags.get(flag) is True
+
+
+def live_version() -> tuple[int, int, int] | None:
+    """(major, minor, bugfix) of the running Live, or None when unknown."""
+    info = get_cached_script_info()
+    if not info:
+        return None
+    version = info.get("live_version")
+    if not isinstance(version, dict):
+        return None
+    try:
+        return (
+            int(version["major"]),
+            int(version["minor"]),
+            int(version["bugfix"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def handshake(send_command) -> dict[str, Any]:
     """Query Live for script info. On old scripts, get_script_info is unknown."""
     global _script_info, _handshake_done
