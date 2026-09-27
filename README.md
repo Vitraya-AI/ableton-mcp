@@ -11,7 +11,7 @@ Prompt-assisted music production across Session and Arrangement view: write and 
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![Remote Script 1.11.1](https://img.shields.io/badge/Remote%20Script-1.11.1-555)
 
-[**What's new**](#-whats-new-in-20) · [**Tool reference**](#-tool-reference) · [**Roadmap**](#-roadmap) · [**Issues**](https://github.com/Vitraya-AI/ableton-mcp/issues)
+[**What's new**](#-whats-new-in-20) · [**Tool reference**](#-tool-reference) · [**Agent skills**](#-agent-skills) · [**Roadmap**](#-roadmap) · [**Issues**](https://github.com/Vitraya-AI/ableton-mcp/issues)
 
 </div>
 
@@ -100,6 +100,7 @@ That's it. Ask Claude to build something. 🎶
 - [Quickstart](#-quickstart)
 - [What's new in 2.0](#-whats-new-in-20)
 - [Tool reference](#-tool-reference)
+- [Agent skills](#-agent-skills)
 - [Components](#-components)
 - [Installation](#-installation)
 - [Usage](#-usage)
@@ -169,6 +170,30 @@ Create, fire, rename and delete scenes; duplicate clips; delete tracks; set the 
 | **Transport and song** | `start_playback`, `stop_playback`, `set_tempo`, `set_time_signature`, `undo`, `redo` |
 | **Devices and racks** | `get_device_parameters`, `set_device_parameter`, `set_device_enabled`, `delete_device`, `get_rack_info`, `navigate_device_preset` |
 | **Browser** | `get_browser_tree`, `get_browser_items_at_path`, `load_instrument_or_effect`, `load_drum_kit` |
+
+---
+
+## 🎓 Agent skills
+
+The tools give an AI access to Live; the [skills](skills/README.md) teach it
+to use them like a co-producer. There are 13 skills and 4 slash commands,
+adapted from [glincker/ableton-skills](https://github.com/glincker/ableton-skills)
+and rewritten against 2.0's real tools:
+
+- **`using-ableton-mcp`**, the foundation: indices, Ableton note names (C3 = 60), beats vs bars, Session vs Arrangement, error codes, undo, and what Live 11 can't do
+- **Making music:** `producer-mode`, `groove-builder`, `chord-pro`, `midi-cleanup`, `arrangement-coach`, `sound-designer`, `tempo-coach`, `reference-match`
+- **Mixing:** `mixer-doctor`, `sidechain-setup`, `vocal-chain`, `mastering-prep`
+- **Commands:** `/ableton-init`, `/ableton-snapshot`, `/ableton-export`, `/ableton-debug`
+
+Install them into Claude Code (from a clone):
+
+```bash
+mkdir -p ~/.claude/skills ~/.claude/commands
+for d in skills/*/; do [ "$(basename "$d")" = templates ] || cp -R "${d%/}" ~/.claude/skills/; done
+cp commands/*.md ~/.claude/commands/
+```
+
+For Cursor, Codex and Gemini CLI, and the per-project `CLAUDE.md` template, see [skills/README.md](skills/README.md). A test checks that every tool the skills name exists in this server.
 
 ---
 
@@ -442,6 +467,7 @@ uv run --with pytest python -m pytest -q        # full test suite, no Ableton ne
 - [x] Loading an instrument reports the device that appeared
 - [x] Telemetry and dataset hidden and inactive; consent prompt removed from tool output
 - [x] Verified end to end in Ableton Live 11.3.43
+- [x] Agent skills and slash commands tailored to 2.0
 
 ### 🔜 Still to do
 - [ ] 🔌 Third-party plugins: list and load VST/AU plugins in one request, with friendly parameter names for popular synths
@@ -452,6 +478,11 @@ uv run --with pytest python -m pytest -q        # full test suite, no Ableton ne
 - [ ] 🆕 Test end to end on Live 12 (native arrangement MIDI clips, locator renaming)
 - [ ] 🪆 Address devices in racks nested more than one level deep
 - [ ] 🚀 Publish 2.0 as a package so plain `uvx` installs it
+- [ ] 📊 Read track and master level meters (the mix and mastering skills ask the user for now)
+- [ ] 🔀 Create return tracks, and load devices on returns and the master
+- [ ] 🏷️ Show parameter values as Live displays them (Hz, dB, ms), not just raw values
+- [ ] 🎨 Set track colours
+- [ ] 🧵 Choose a compressor's sidechain source
 
 ---
 
