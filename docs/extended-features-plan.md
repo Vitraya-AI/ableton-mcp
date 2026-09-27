@@ -1,6 +1,6 @@
 # Extended Features Port — Plan
 
-Status: **Phases 0–1 done (Remote Script 1.10.1); Phase 1 fixes awaiting a Live re-check; next is Phase 2** (written 2026-09-26). Work happens on the
+Status: **Phases 0–1 done (Remote Script 1.10.2); awaiting a final Live re-check of Arrangement steps 2, 6, 7, 8; next is Phase 2** (written 2026-09-26). Work happens on the
 `extended-features` branch. This document is the hand-off: a new session should
 be able to start Phase 0 from here without the conversation that produced it.
 
@@ -124,7 +124,16 @@ change, undo steps span the whole command, and cue toggles only happen when
 the target cue is selected. `get_arrangement_info` clips now report the
 timeline `length` plus `loop_length`. Server: browser depth clamped before
 sending; MIDI clip output shows `(method: …)`.
-**Still to do in Live:** re-run "Arrangement (1.10.1)", especially step 7.
+Re-test of 1.10.1: positions, jumps and cue delete all correct. Fixed in
+1.10.2: **Live 11 can't rename locators from a script** (`CuePoint.name` is
+"Get/Listen" in Live 11; settable in Live 12's LOM) — new flag
+`live_api.cue_point_set_name`, and `create_locator` reports
+`name_applied: false` honestly instead of implying success; playhead restore
+is clamped to the song length and never fails a successful edit (it failed
+with "Cannot set the Songtime behind the Songlength" after the song
+shrank); `create_arrangement_audio_clip` restores the playhead;
+`set_arrangement_time` reports where Live actually put it.
+**Still to do in Live:** "Arrangement (1.10.2)" steps 2, 6, 7, 8.
 
 **Rule for new commands:** anything that writes a Live property and then
 depends on it in the same command (playhead, loop, markers…) must be a
