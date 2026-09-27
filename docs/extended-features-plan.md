@@ -1,6 +1,6 @@
 # Extended Features Port — Plan
 
-Status: **Phase 0 done (Remote Script 1.9.0); next is Phase 1** (written 2026-09-26). Work happens on the
+Status: **Phase 0 done and verified in Live 11.3.43 (Remote Script 1.9.1); next is Phase 1** (written 2026-09-26). Work happens on the
 `extended-features` branch. This document is the hand-off: a new session should
 be able to start Phase 0 from here without the conversation that produced it.
 
@@ -40,7 +40,10 @@ part of this effort.
 
 ## Live API findings (Live 11.3)
 
-Sources: runtime captures at
+**Authoritative source for this Live build:** the API dump written by
+`ableton-mcp-dump-live-api` to `docs/live-api/11.3.43/` (gitignored; regenerate
+with that command while Live runs — about 8 s). It has every class, member and
+Boost.Python signature. Earlier sources, useful for other versions: runtime captures at
 `https://midiremotescripts.structure-void.com/reference/live11/Live.<Module>.runtime/`
 and the generated 11→12 diff at
 `https://midiremotescripts.structure-void.com/guides/runtime-changes-11-to-12/`
@@ -52,12 +55,13 @@ against the "Added in Live 12" list:
 | API | Live 11.3 | Consequence |
 |---|---|---|
 | `Track.create_midi_clip(start, length)` | ❌ Live 12 only | Arrangement MIDI clips need a fallback on 11 (see Phase 1). |
-| `Track.create_audio_clip` / `ClipSlot.create_audio_clip` | ⚠️ Conflicting | Listed in the "Live 11" capture; the fork's `create_audio_clip` docstring says 12.0.5+. Resolve with the Phase 0 probe. Not needed for phases 0–2. |
+| `ClipSlot.create_audio_clip(path) -> Clip` | ✅ **confirmed on 11.3.43** | A real .wav imported via the existing `create_audio_clip` tool. The fork's old "12.0.5+" note was wrong (fixed in 1.9.1). |
+| `Track.create_audio_clip(path, time) -> None` | ✅ present on 11.3.43 (API dump) | "Inserts it into the arrangement at the specified time"; errors on non-audio/frozen tracks, time outside [0, 1576800], or an invalid file. Not yet exercised by any tool. |
 | `Track.duplicate_clip_to_arrangement`, `Track.delete_clip`, `Track.arrangement_clips` | ✅ | |
 | `Song.cue_points`, `set_or_delete_cue`, `jump_to_next_cue`, `jump_to_prev_cue`, `CuePoint.jump` | ✅ | |
 | `Song.loop`, `loop_start`, `loop_length`, `song_length`, `back_to_arranger` | ✅ | (`Track.back_to_arranger` is Live 12; the extended repo uses the Song one.) |
 | `Clip`: `muted`, `color`, `looping`, `loop_start/end`, `start_marker`, `gain`, `pitch_coarse/fine`, `warping`, `warp_mode`, `is_arrangement_clip` | ✅ | |
-| `Clip.automation_envelope`, `create_automation_envelope`, `clear_envelope`, `clear_all_envelopes`; `AutomationEnvelope.insert_step`, `value_at_time` | ✅ | Phase 4 is feasible on 11 (`insert_step` moved to `Envelope` in 12 — handle both). |
+| `Clip.automation_envelope`, `create_automation_envelope`, `clear_envelope`, `clear_all_envelopes`; `AutomationEnvelope.insert_step(time, duration, value)`, `value_at_time` | ✅ | Phase 4 is feasible on 11 for **Session** clips (`insert_step` moved to `Envelope` in 12 — handle both). Live's own docstring: `automation_envelope` "Returns None for Arrangement clips", so Arrangement automation needs another route. |
 | `Song.begin_undo_step` / `end_undo_step` | ✅ | Verified live on 11.3 (1.8.1 undo fix). |
 | `Device.parameters`, `can_have_chains`, `can_have_drum_pads`, `class_name`; `RackDevice.chains`, `drum_pads`, `visible_drum_pads`; `Chain.devices`, `Chain.delete_device`; `Track.delete_device`; `DrumPad.note/chains/mute/solo` | ✅ | |
 | `Device.is_active` | ✅ read-only | Toggle a device with its "Device On" parameter (`parameters[0]`), as the extended repo does. |
@@ -71,8 +75,13 @@ keeps its own (reads 10 s, edits 15 s, `create_audio_clip` 65 s,
 `dump_live_api` 60 s). Helpers now available: `script_handshake.live_api_available(flag)`,
 `script_handshake.live_version()`, and `MCP_Server/timing.py`
 (`resolve_position`, `resolve_length`, `bar_to_beat`, `beat_to_bar`).
-**Still to do in Live:** run the Phase 0 smoke checks and the API dump; record
-whether `ClipSlot.create_audio_clip` exists on 11.3.
+Verified in Live 11.3.43: handshake reports the version and flags
+(`track_create_midi_clip: false`, `envelope_insert_step: false`, everything
+else true); the API dump works. Follow-up in 1.9.1: `create_audio_clip`
+returns `invalid_audio_file` for a bad path (checked before calling Live, and
+Live's own "valid audio file" error is mapped too), and its docstrings no
+longer claim Live 12.0.5+. `dump_live_api` is deliberately not an MCP tool —
+use the `ableton-mcp-dump-live-api` command.
 
 1. **Live version and API flags in the handshake.** `get_script_info` gains
    `live_version` (from `Live.Application.get_application().get_major_version()`
@@ -93,7 +102,7 @@ whether `ClipSlot.create_audio_clip` exists on 11.3.
    (fetched once per call from `get_session_info`). Beats per bar =
    `numerator * 4 / denominator`. Bar 1 = beat 0. Reject bar < 1.
 
-## Phase 1 — Arrangement (Remote Script 1.9.1)
+## Phase 1 — Arrangement (Remote Script 1.10.0)
 
 Existing arrangement tools in the fork, keep as they are: `create_locator`,
 `duplicate_to_arrangement`, `get_arrangement_clips`, `set_arrangement_time`,
@@ -109,9 +118,10 @@ time), matching `get_arrangement_clips`.
 | `create_arrangement_midi_clip(track_index, start, length, notes=None, name=None)` (new; `start_bar`/`length_bars` alternatives) | Live 12: `track.create_midi_clip`. **Live 11 fallback:** find an empty Session slot on that track (error `no_free_clip_slot` if none, or create a scene and remove it afterwards), `create_clip(length)`, add notes, `track.duplicate_clip_to_arrangement(clip, start)`, delete the temporary Session clip — all inside one undo step. Refuse overlapping an existing arrangement clip unless `allow_overlap=True` (extended's `_check_overlap` idea). Returns the new clip's arrangement index. MIDI tracks only. |
 | Note tools gain `view="session" \| "arrangement"` | `get_clip_notes`, `add_notes_to_clip`, `modify_clip_notes`, `remove_notes_from_clip`, `clear_notes_from_clip`. With `view="arrangement"`, `clip_index` indexes `track.arrangement_clips`. One shared resolver in the Remote Script (`_resolve_clip(track_index, clip_index, view)`). Default stays `session`, so existing callers are unaffected. |
 | `delete_clip` gains `view` | Arrangement deletion uses `track.delete_clip(clip)`. |
+| *(proposed, awaiting user OK)* `create_arrangement_audio_clip(track_index, path, start / start_bar)` | `Track.create_audio_clip` exists on 11.3.43, so arrangement audio clips are possible. Was out of scope only because it looked Live-12-only. Returns the new clip's arrangement index (Live returns None, so find it by start time). |
 | `set_clip_properties(track_index, clip_index, properties, view="session")` (new) | Sets several properties in one call from an allowlist: `name`, `muted`, `color`, `looping`, `loop_start`, `loop_end`, `start_marker`, `end_marker`, `gain`, `pitch_coarse`, `pitch_fine`, `warping`, `warp_mode`. Audio-only keys (`gain`, `pitch_*`, `warp*`) error with a clear code on MIDI clips. Unknown keys → `invalid_value` listing the allowed ones. Returns the values read back. |
 
-## Phase 2 — Devices and racks (Remote Script 1.10.0)
+## Phase 2 — Devices and racks (Remote Script 1.11.0)
 
 **Device addressing inside racks.** Add optional `chain_index` and
 `chain_device_index` to `get_device_parameters`, `set_device_parameter`,

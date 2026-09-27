@@ -820,9 +820,10 @@ def create_audio_clip(ctx: Context, track_index: int, clip_index: int, path: str
     """
     Create a new audio clip in an audio track's clip slot by importing a file.
 
-    Requires Ableton Live 12.0.5 or newer — the underlying
-    ClipSlot.create_audio_clip Live API was introduced in 12.0.5 and is not
-    available in earlier 12.0.x releases.
+    Works on Live versions that have ClipSlot.create_audio_clip (confirmed on
+    Live 11.3.43; get_remote_script_info reports it as
+    live_api.clip_slot_create_audio_clip). A missing or unreadable file fails
+    with code invalid_audio_file.
 
     Parameters:
     - track_index: The index of the audio track to create the clip in

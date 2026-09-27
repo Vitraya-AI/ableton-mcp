@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.9.0"
+SCRIPT_VERSION = "1.9.1"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -104,6 +104,8 @@ _ERROR_CODE_PATTERNS = (
     ("path part", "browser_path_not_found"),
     ("unknown or unavailable category", "browser_path_not_found"),
     ("not loadable", "not_loadable"),
+    # Live's own wording when ClipSlot/Track.create_audio_clip rejects a file.
+    ("valid audio file", "invalid_audio_file"),
     ("unknown command", "unknown_command"),
     ("timeout waiting", "timeout"),
 )
@@ -900,16 +902,19 @@ class AbletonMCP(ControlSurface):
     def _create_audio_clip(self, track_index, clip_index, path):
         """Create an audio clip in the specified audio track clip slot by importing a file.
 
-        Requires Ableton Live 12.0.5 or newer (the underlying
-        ClipSlot.create_audio_clip Live API was introduced in 12.0.5 — it is
-        not available in earlier 12.0.x releases).
+        Needs ClipSlot.create_audio_clip, which get_script_info reports as
+        live_api.clip_slot_create_audio_clip (present on Live 11.3.43).
         """
         try:
             if not path:
-                raise ValueError("Audio file path is required")
+                raise CommandError("Audio file path is required", "invalid_audio_file")
 
             if not os.path.isabs(path):
-                raise ValueError("Audio file path must be absolute (got: %s)" % path)
+                raise CommandError(
+                    "Audio file path must be absolute (got: %s)" % path, "invalid_audio_file")
+
+            if not os.path.isfile(path):
+                raise CommandError("Audio file not found: %s" % path, "invalid_audio_file")
 
             if track_index < 0 or track_index >= len(self._song.tracks):
                 raise IndexError("Track index out of range")
@@ -928,10 +933,9 @@ class AbletonMCP(ControlSurface):
                 raise Exception("Clip slot already has a clip")
 
             if not hasattr(clip_slot, "create_audio_clip"):
-                raise Exception(
+                raise CommandError(
                     "ClipSlot.create_audio_clip is unavailable in this Ableton Live "
-                    "version. Requires Live 12.0.5 or newer."
-                )
+                    "version", "not_supported")
 
             clip_slot.create_audio_clip(path)
 

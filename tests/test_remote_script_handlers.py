@@ -615,3 +615,57 @@ def test_track_info_flags_group_tracks(script):
     assert info["arm"] is False
     info = run(inst, "get_track_info", track_index=1)["result"]
     assert (info["is_group_track"], info["is_grouped"], info["can_be_armed"]) == (False, True, True)
+
+
+# --------------------------------------------------------------------------
+# create_audio_clip error codes
+# --------------------------------------------------------------------------
+
+class FakeAudioSlot(FakeClipSlot):
+    def __init__(self, error=None):
+        super(FakeAudioSlot, self).__init__()
+        self.error = error
+        self.created = []
+
+    def create_audio_clip(self, path):
+        if self.error:
+            raise RuntimeError(self.error)
+        self.created.append(path)
+        self.clip = types.SimpleNamespace(name="Take", length=8.0, is_audio_clip=True)
+
+
+def _audio_song(slot):
+    song = FakeSong()
+    track = song.tracks[0]
+    track.has_midi_input = False
+    track.has_audio_input = True
+    track.clip_slots[0] = slot
+    return song
+
+
+@pytest.mark.parametrize("path", ["", "relative.wav", "/no/such/file.wav"])
+def test_create_audio_clip_bad_path_is_invalid_audio_file(script, path):
+    slot = FakeAudioSlot()
+    response = run(make_instance(script, _audio_song(slot)), "create_audio_clip",
+                   track_index=0, clip_index=0, path=path)
+    assert response["code"] == "invalid_audio_file"
+    assert slot.created == []
+
+
+def test_live_rejecting_the_file_is_invalid_audio_file(script, tmp_path):
+    wav = tmp_path / "not-audio.wav"
+    wav.write_text("text")
+    slot = FakeAudioSlot("The provided path does not appear to point to a valid audio file")
+    response = run(make_instance(script, _audio_song(slot)), "create_audio_clip",
+                   track_index=0, clip_index=0, path=str(wav))
+    assert response["code"] == "invalid_audio_file"
+
+
+def test_create_audio_clip_imports_an_existing_file(script, tmp_path):
+    wav = tmp_path / "take.wav"
+    wav.write_bytes(b"RIFF")
+    slot = FakeAudioSlot()
+    response = run(make_instance(script, _audio_song(slot)), "create_audio_clip",
+                   track_index=0, clip_index=0, path=str(wav))
+    assert response["status"] == "success"
+    assert slot.created == [str(wav)]

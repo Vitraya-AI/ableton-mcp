@@ -9,7 +9,7 @@ to the Remote Script.
 1. Run `ableton-mcp-install-script`, then restart Live.
 2. Open a fresh, empty Live set.
 3. Start the MCP server and call `get_remote_script_info`. Confirm it reports
-   script version 1.9.0 and `up_to_date: true`. Confirm `live_version` shows
+   script version 1.9.1 and `up_to_date: true`. Confirm `live_version` shows
    your Live build and `live_api` lists the version-dependent APIs (on Live 11
    expect `track_create_midi_clip: false`, `song_begin_undo_step: true`,
    `automation_envelope_insert_step: true`).
@@ -72,9 +72,12 @@ to the Remote Script.
 
 ## Errors and connection
 
-1. Call `set_track_mute` with a track index that does not exist. Confirm the
+1. Call `create_audio_clip` on an empty audio slot with a path that does not
+   exist, then with a text file renamed to `.wav`. Both should end with
+   `(code: invalid_audio_file)`. Then a real `.wav`: the clip appears.
+2. Call `set_track_mute` with a track index that does not exist. Confirm the
    error ends with `(code: track_index_out_of_range)`.
-2. Immediately call `get_session_info`. Confirm it answers without a reconnect:
+3. Immediately call `get_session_info`. Confirm it answers without a reconnect:
    the MCP server log (Claude Desktop: `~/Library/Logs/Claude/mcp-server-AbletonMCP.log`)
    shows no new "Connected to Ableton" line.
 
