@@ -1,8 +1,9 @@
 <div align="center">
 
 # 🎛️ Ableton MCP 2.0
+## with Skills!
 
-**Connect Ableton Live to Claude AI**
+**Connect Your Agent to Ableton Live**
 
 Prompt-assisted music production across Session and Arrangement view: write and edit notes, mix, build arrangements, and work inside racks, driven by AI.
 
